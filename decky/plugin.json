@@ -1,0 +1,11 @@
+{
+  "name": "DeckPilot TV",
+  "author": "DeckPilot project",
+  "api_version": 1,
+  "flags": [],
+  "publish": {
+    "tags": ["gaming", "performance"],
+    "description": "Simple three-mode Steam Deck OLED TV game optimiser. Requires DeckPilot TV background app.",
+    "image": ""
+  }
+}
