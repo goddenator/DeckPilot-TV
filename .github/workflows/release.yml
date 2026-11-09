@@ -1,0 +1,54 @@
+name: Build DeckPilot releases
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test Python app
+        run: |
+          cd app
+          python3 -m unittest discover -v
+          bash -n install.sh setup_drive.sh uninstall.sh
+      - name: Build Decky frontend
+        run: |
+          cd decky
+          npm install
+          npm run build
+          test -s dist/index.js
+      - name: Assemble release assets
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, zipfile
+          tag=os.environ.get('GITHUB_REF_NAME','v0.6.0')
+          version=tag.removeprefix('v')
+          src=pathlib.Path('app'); out=pathlib.Path('out');out.mkdir(exist_ok=True)
+          folder='deckpilot_tv_v'+version.replace('.','_')
+          files=['deckpilot.py','updater.py','README.md','VERSION.txt','install.sh',
+                 'uninstall.sh','check.sh','setup_drive.sh','test_deckpilot.py','test_updater.py']
+          manifest={'product':'deckpilot-tv','version':version,'files':{}}
+          with zipfile.ZipFile(out/('DeckPilot_TV_v'+version+'.zip'),'w',zipfile.ZIP_DEFLATED) as z:
+            for fn in files:
+              data=(src/fn).read_bytes()
+              manifest['files'][fn]=hashlib.sha256(data).hexdigest()
+              z.writestr(folder+'/'+fn,data)
+            z.writestr(folder+'/deckpilot-release.json',json.dumps(manifest,indent=2)+'\n')
+          with zipfile.ZipFile(out/('DeckPilot_Decky_v'+version+'.zip'),'w',zipfile.ZIP_DEFLATED) as z:
+            for fn in ['plugin.json','package.json','main.py','LICENSE','README.md','dist/index.js']:
+              z.write(pathlib.Path('decky')/fn,'DeckPilot/'+fn)
+          PY
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.zip
+          generate_release_notes: true
