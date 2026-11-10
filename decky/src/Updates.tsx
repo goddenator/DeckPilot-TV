@@ -10,7 +10,7 @@ export function Updates(){
   const [url,setUrl]=useState('');
   const lock=useRef(false);
   const refresh=async()=>{const r=await api.getUpdates();if(r.error)throw Error(r.error);setState(r);};
-  useEffect(()=>{let live=true;const load=()=>void api.getUpdates().then(r=>{if(live){setState(r);if(r.error)setMessage(r.error);}}).catch(()=>{if(live)setMessage('Update helper unavailable.');});load();const timer=setInterval(load,3000);return()=>{live=false;clearInterval(timer);};},[]);
+  useEffect(()=>{let live=true;let pending=false;const load=()=>{if(pending)return;pending=true;void api.getUpdates().then(r=>{if(live){setState(r);if(r.error)setMessage(r.error);}}).catch(()=>{if(live)setMessage('Update helper unavailable.');}).finally(()=>{pending=false;});};load();const timer=setInterval(load,3000);return()=>{live=false;clearInterval(timer);};},[]);
   const run=async(action:()=>Promise<{error?:string;message?:string}>)=>{
     if(lock.current)return;lock.current=true;setBusy(true);setMessage('');
     try{const r=await action();setMessage(r.error||r.message||'Done.');await refresh();}catch(e){setMessage(e instanceof Error?e.message:'Update unavailable.');}

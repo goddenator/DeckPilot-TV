@@ -38,11 +38,13 @@ class Plugin:
             try: stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180 if update_helper and args and args[0]=='suite-check' else 120 if args and args[0]=='cloud-upload' else 45)
             except asyncio.TimeoutError:
                 proc.kill(); await proc.communicate()
-                return {'ok': False, 'error': 'DeckPilot took too long to respond.'}
-            if proc.returncode: return {'ok': False, 'error': 'DeckPilot command failed. Check local diagnostics.'}
+                return {'ok': False,'uncertain':args[0] in ('approve','play-approve'), 'error': 'DeckPilot timed out. Check settings before retrying.'}
+            if proc.returncode: return {'ok': False,'uncertain':args[0] in ('approve','play-approve'), 'error': 'DeckPilot command failed. Check local diagnostics.'}
             raw = stdout.decode(errors='replace').strip()
             try: return json.loads(raw)
-            except ValueError: return {'ok': True, 'message': raw[:250]}
+            except ValueError:
+                if args[0] in ('approve','play-approve'):return {'ok':False,'uncertain':True,'error':'Apply result is unknown. Check settings and use Steam.'}
+                return {'ok': True, 'message': raw[:250]}
         except (OSError, ValueError, KeyError):
             return {'ok': False, 'error': 'Cannot run DeckPilot as deck. Verify the app installation and Decky user configuration.'}
 
@@ -56,6 +58,9 @@ class Plugin:
         state['plugin_version']=self._plugin_version()
         state['update_suite']=await self.get_updates()
         return state
+
+    async def process_state(self, appid: str, context: str):
+        return await self._run('process-status',str(appid),'--context',context)
 
     async def get_updates(self):
         return await self._run('suite-status','--plugin-version',self._plugin_version(),update_helper=True)
@@ -99,7 +104,7 @@ class Plugin:
         if not isinstance(enabled, bool): return {'ok':False,'error':'Expected on/off'}
         return await self._run('play-enable' if enabled else 'play-disable')
     async def play_plan(self, appid: str, context: str):
-        return await self._run('play-plan', str(appid), '--context', context)
+        return await self._run('play-plan','--launch-protocol','2', str(appid), '--context', context)
     async def play_preview(self, appid: str, mode: str, context: str):
         return await self._run('play-preview', str(appid), '--mode', mode, '--context', context)
     async def play_approve(self, appid: str, mode: str, token: str, context: str):

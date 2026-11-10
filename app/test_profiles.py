@@ -69,7 +69,7 @@ class ProfileTests(GameFixture):
         self.assertTrue(d.game_checkup('1234')['can_restore'])
         self.path.write_text(self.path.read_text().replace('1920','1700'))
         c=d.game_checkup('1234');self.assertEqual(c['status'],'manual-changes');self.assertFalse(c['optimised']);self.assertFalse(c['can_restore']);self.assertEqual(c['backups'],1)
-        self.running.return_value=True;self.assertEqual(d.game_checkup('1234')['status'],'running')
+        self.running.return_value={'state':'running'};self.assertEqual(d.game_checkup('1234')['status'],'running')
         self.assertEqual(d.game_checkup('5555')['status'],'not-installed')
 
     def test_missing_backup_is_not_reported_as_optimised(self):
@@ -84,7 +84,7 @@ class ProfileTests(GameFixture):
         result=d.apply_profile(self.game,'graphics',expected_hashes=fingerprints)
         self.assertEqual(result['status'],'error');self.assertIn('UserKey=changed',self.path.read_text());self.assertNotIn('1920',self.path.read_text())
         self.path.write_text(self.raw)
-        self.running.side_effect=[False,True]
+        self.running.side_effect=[{'state':'closed'},{'state':'running'}]
         result=d.apply_profile(self.game,'graphics')
         self.assertEqual(result['status'],'error');self.assertEqual(self.path.read_text(),self.raw)
 

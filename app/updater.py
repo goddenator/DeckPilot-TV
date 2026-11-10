@@ -403,7 +403,7 @@ def recover_interrupted(appdir=APPDIR,updates=UPDATES,manage_service=True):
     appdir=Path(appdir);updates=Path(updates);journal=updates/'transaction.json'
     try:data=json.loads(journal.read_text());hashes=data['files']
     except (OSError,ValueError,KeyError) as exc:raise UpdateError('No valid interrupted-update recovery record.') from exc
-    if not isinstance(hashes,dict) or not set(hashes).issubset(APP_FILES):raise UpdateError('Invalid recovery file list.')
+    if not isinstance(hashes,dict) or 'deckpilot.py' not in hashes or not set(hashes).issubset(APP_FILES) or any(not isinstance(v,str) or not re.fullmatch('[a-f0-9]{64}',v) for v in hashes.values()):raise UpdateError('Invalid recovery file list.')
     candidates=[updates/'recovery-app',updates/'previous-app']
     backup=next((root for root in candidates if all((root/name).is_file() and not (root/name).is_symlink() and hashlib.sha256((root/name).read_bytes()).hexdigest()==digest for name,digest in hashes.items())),None)
     if backup is None:raise UpdateError('Recovery snapshot is missing or changed. No files were written.')

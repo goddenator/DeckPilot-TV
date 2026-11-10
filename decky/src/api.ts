@@ -3,7 +3,7 @@ import type { LaunchPlan } from './launchController';
 
 export type Mode = 'graphics' | 'performance' | 'balanced';
 export type Profile = 'docked' | 'handheld';
-export type Result = {ok?:boolean;error?:string;message?:string};
+export type Result = {uncertain?:boolean;ok?:boolean;error?:string;message?:string};
 export type Game = {appid:string;name:string;mode?:Mode;supported?:boolean;adapter?:string;approved?:boolean;metrics?:{avg_fps:number;low_1pct_fps:number;frame_time_p95_ms?:number;measurement_note?:string}};
 export type UpdateSuite = Result & {protocol?:number;channel?:string;repository?:string;app_installed?:string;plugin_installed?:string;compatible?:boolean;status?:string;operation?:{status?:string;message?:string};available?:boolean;version?:string;token?:string;commit?:string;app_needed?:boolean;plugin_needed?:boolean;downgrade?:boolean;app_first?:boolean;app_rollback?:boolean;plugin_rollback?:boolean;recovery_required?:boolean};
 export type State = Result & {
@@ -16,11 +16,12 @@ export type State = Result & {
   display?:{vrr_capability:string;vrr_enabled:string;note:string;external_outputs:{connector:string;advertised_modes:string[]}[]};
   update?:{available?:boolean;version?:string;can_undo?:boolean;status?:string;github?:{message?:string}};
 };
-export type Checkup = Result & {status?:string;optimised?:boolean;can_restore?:boolean;backups?:number};
+export type Checkup = Result & {process?:{state?:string;reason?:string;appid?:string};status?:string;optimised?:boolean;can_restore?:boolean;backups?:number};
 export type Report = {source:string;url:string;device:string;game_version?:string;report_date?:string;retrieved_at:string;resolution?:string;fps?:string;fps_kind?:string;report_id?:string;display_context:string;summary:string;uncertainty:string;stale?:boolean};
 export type Research = Result & {game?:Game;reports?:Report[];recommendation?:{mode:Mode;confidence:string;reason:string;note:string};sources?:{source:string;status:string;url:string;page_url?:string;message?:string;cached?:boolean;stale?:boolean}[]};
 export type Preview = Result & {status?:string;token?:string;summary?:{resolution:string;quality?:string;files:number;manual_files:number};files?:{file:string;location?:string;adapter:string;manual_changes:boolean;changes:{key:string;before?:string;after:string}[]}[]};
 export const api = {
+  processState:callable<[string,Profile],{state?:string}>('process_state'),
   getUpdates: callable<[],UpdateSuite>('get_updates'),
   checkUpdates: callable<[],UpdateSuite>('check_updates'),
   setUpdateChannel: callable<[string],Result>('set_update_channel'),

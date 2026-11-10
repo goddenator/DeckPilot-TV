@@ -34,7 +34,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 VERSION = '0.8.3'
-BUILD_ID = '0.8.3-preview.2'
+BUILD_ID = '0.8.3-preview.3'
 APP = 'deckpilot-tv'
 PORT = 38647
 MODES = {'graphics', 'performance', 'balanced'}
@@ -69,7 +69,7 @@ GAME_KEYS = ['ResolutionSizeX', 'ResolutionSizeY',
 
 
 def mkdir():
-    BASE.mkdir(parents=True, exist_ok=True)
+    BASE.mkdir(parents=True, exist_ok=True,mode=0o700)
 
 
 def log(message):
@@ -637,8 +637,9 @@ def installed_games(home=None):
                 continue
             appid = parse_vdf_key(raw, 'appid')
             name = parse_vdf_key(raw, 'name')
-            if not appid or not appid.isdigit() or not name:
-                continue
+            try:appid=steam_id(appid)
+            except ValueError:continue
+            if manifest.name!='appmanifest_'+appid+'.acf' or not name:continue
             results[appid] = {'appid': appid, 'name': name, 'library': str(folder), 'path': str(manifest)}
     return sorted(results.values(), key=lambda g: g['name'].casefold())
 
@@ -650,7 +651,7 @@ def proton_prefix(library, appid):
 def find_ue_configs(game):
     """Only paths explicitly matching Unreal Engine's known saved config layout."""
     local = proton_prefix(game['library'], game['appid'])
-    if not local.is_dir():
+    if not local.is_dir() or any(p.is_symlink() for p in [local,*local.parents] if p != Path(game['library'])):
         return []
     result = []
     try:
@@ -744,7 +745,8 @@ def preview_profile(appid, mode, context=None):
     if not isinstance(mode, str) or mode not in MODES: raise ValueError('Unknown mode.')
     game = next((g for g in installed_games() if g['appid'] == appid), None)
     if not game: return {'ok': True, 'status': 'not-installed', 'files': [], 'message': 'Preference can be saved now. Install and launch once, then preview supported settings.'}
-    if game_is_running(appid): return {'ok': True, 'status': 'running', 'files': [], 'message': 'Close the game before previewing or applying.'}
+    visibility=game_running_state(appid)
+    if visibility['state']!='closed': return {'ok':True,'status':visibility['state'],'files':[],'message':'Close the game before changes.' if visibility['state']=='running' else 'Cannot confirm game closed. Use Steam to play; settings unchanged.'}
     files, fingerprints = [], []
     state = read_json(STATE, {})
     if not isinstance(state, dict): return {'ok': False, 'error': 'Invalid local backup state; no changes approved.'}
@@ -761,7 +763,14 @@ def preview_profile(appid, mode, context=None):
             if adapter == 'unreal':
                 allowed = set(SCALABILITY_KEYS + GAME_KEYS + ['sg.ResolutionQuality'])
                 def values(text):
-                    return {m[1]: m[2] for m in re.finditer(r'^\s*([\w.]+)\s*=\s*([^\r\n]*)', text, re.M) if m[1] in allowed}
+                    result={}
+                    for part in parse_ini_sections(text):
+                        head=re.match(r'^\s*\[([^\r\n\]]+)\]',part)
+                        if not head or head[1].casefold() not in ('scalabilitygroups','/script/engine.gameusersettings'):continue
+                        for m in re.finditer(r'^\s*([\w.]+)\s*=\s*([^\r\n]*)',part,re.M):
+                            key=next((k for k in allowed if k.casefold()==m[1].casefold()),None)
+                            if key and key.startswith('sg.')==(head[1].casefold()=='scalabilitygroups'):result[key]=m[2]
+                    return result
                 before, after = values(raw), values(changed)
             else:
                 import xml.etree.ElementTree as ET
@@ -813,8 +822,10 @@ def game_checkup(appid, context=None):
               'status': 'not-installed', 'can_restore': False, 'backups': 0, 'optimised': False}
     if not game: return {**result, 'message': 'Saved for when you install it.'}
     files = adapter_files(game)
+    result['process']=game_running_state(appid)
     if not files: return {**result, 'status': 'advisory', 'message': 'Advice only. No supported settings file.'}
-    running = game_is_running(appid)
+    visibility=result['process']
+    running=visibility['state']!='closed'
     state = read_json(STATE, {})
     if not isinstance(state, dict): return {**result, 'status': 'error', 'message': 'Backup records need review.'}
     matches, manual, restorable, unreadable = True, False, 0, False
@@ -829,6 +840,7 @@ def game_checkup(appid, context=None):
                 manual |= not unchanged
                 backup = Path(record.get('backup', ''))
                 safe = backup.is_file() and not backup.is_symlink() and backup.resolve().is_relative_to(BACKUPS.resolve())
+                safe &= not record.get('backup_sha256') or backup_digest(backup)==record['backup_sha256']
                 result['backups'] += int(safe)
                 unreadable |= not safe
                 restorable += int(safe and unchanged)
@@ -837,7 +849,8 @@ def game_checkup(appid, context=None):
                 and all(str(p) in cfg['approved_files'].get(appid, []) for p, _ in files))
     result['can_restore'] = bool(restorable and not running)
     result['optimised'] = bool(matches and approved and not manual and not unreadable)
-    if running: status, message = 'running', 'Close the game to make changes.'
+    if visibility['state']=='uncertain':status,message='uncertain','Cannot confirm game closed. Settings are protected.'
+    elif running: status, message = 'running', 'Close the game to make changes.'
     elif unreadable: status, message = 'error', 'A settings file or backup needs review.'
     elif manual: status, message = 'manual-changes', 'Your changes are protected.'
     elif result['optimised']: status, message = 'ready', 'Your approved settings match.'
@@ -929,13 +942,15 @@ def cached_launch_advice(appid, context):
             'fps_kind': matching[0].get('fps_kind') if matching else None}
 
 
-def prepare_play(appid, context=None):
+def prepare_play(appid, context=None, protocol=2):
     appid = steam_id(appid); cfg = config(); context = profile_context(context, cfg)
     if not cfg['play_assistant_enabled']: return {'ok': True, 'status': 'disabled', 'appid': appid}
     if context != cfg['context']: return {'ok': False, 'status': 'profile-changed', 'error': 'Profile changed. Open the game again.'}
     game = next((g for g in installed_games() if g['appid'] == appid), None)
     if game is None: return {'ok': False, 'status': 'not-installed', 'error': 'This game is not installed.'}
-    if game_is_running(appid): return {'ok': False, 'status': 'running', 'error': 'Already running. Use Steam to resume.'}
+    visibility=game_running_state(appid)
+    if visibility['state']=='running':return {'ok':False,'status':'running','error':'Already running. Use Steam to resume.'}
+    if visibility['state']=='uncertain':return {'ok':True,'status':'uncertain' if protocol>=2 else 'profile-changed','appid':appid,'context':context,'can_apply':False,'error':None if protocol>=2 else 'Cannot confirm game closed. Use Steam to play.',**cached_launch_advice(appid,context),'message':'Cannot confirm game closed. Advice only; use Steam’s Play/Resume button.'}
     if appid in cfg['launch_dismissed']: return {'ok': True, 'status': 'dismissed', 'appid': appid}
     checkup = game_checkup(appid, context)
     return {'ok': True, 'status': 'prompt', 'appid': appid, 'name': game['name'], 'context': context,
@@ -1001,6 +1016,7 @@ def transform_ue_ini(raw, mode, context=None):
             output.append(part)
             continue
         section = next(x for x in targets if x.casefold() == head.group(1).casefold())
+        if section in found_groups:raise ValueError('Duplicate settings section; resolve in the game first.')
         found_groups.add(section)
         group_map = targets[section]
         lines = part.splitlines(keepends=True)
@@ -1040,6 +1056,12 @@ def sha(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
+def backup_digest(path):
+    with path.open('rb') as handle:data=handle.read(2_000_001)
+    if len(data)>2_000_000:raise ValueError('Backup exceeds settings size limit.')
+    return hashlib.sha256(data).hexdigest()
+
+
 def safe_read_text(path):
     # Unreal config files are typically UTF-8, but many game launchers save
     # UTF-16. We avoid modifying encodings we cannot safely round-trip.
@@ -1050,29 +1072,66 @@ def safe_read_text(path):
     return data.decode('utf-8-sig')
 
 
-def game_is_running(appid):
-    """Best-effort SteamAppId environment scan. Fail safe on uncertainty."""
-    proc = Path('/proc')
-    try:
-        pids = list(proc.iterdir())
-    except OSError:
-        return True
-    for item in pids:
-        if not item.name.isdigit():
-            continue
-        try:
-            blob = (item / 'environ').read_bytes()
-        except (OSError, PermissionError):
-            try:
-                if item.stat().st_uid == os.getuid(): return True
-            except (OSError, PermissionError): pass
-            continue
-        if (b'SteamAppId=' + appid.encode() + b'\x00') in b'\x00' + blob + b'\x00':
-            return True
-        if (b'SteamGameId=' + appid.encode() + b'\x00') in b'\x00' + blob + b'\x00':
-            return True
-    return False
+PROC_ROOT = Path('/proc')
+PROCESS_HELPERS = {'steam', 'steamwebhelper', 'steamservice', 'wineserver', 'pressure-vessel', 'pv-bwrap', 'bwrap', 'reaper','steam-runtime-launcher-service','steam-runtime-launch-client','pressure-vessel-wrap','srt-bwrap','services.exe','winedevice.exe','explorer.exe','rpcss.exe','plugplay.exe'}
 
+def game_running_state(appid, proc=None):
+    """Bounded, read-only evidence. Unknown never grants permission to write."""
+    appid=steam_id(appid); proc=Path(proc) if proc is not None else PROC_ROOT
+    deadline=time.monotonic()+0.5; uncertain=set(); scanned=0
+    def result(state,reason):
+        value={'appid':appid,'state':state,'source':'proc','reason':reason,'scanned':scanned}
+        return value
+    def identity(item):
+        raw=(item/'stat').read_text(); end=raw.rfind(')'); fields=raw[end+2:].split()
+        if end<0 or len(fields)<20:raise ValueError('Invalid process identity')
+        return raw[raw.find('(')+1:end],fields[0],fields[19]
+    try:
+        with os.scandir(proc) as entries:
+            for entry in entries:
+                if not entry.name.isdigit():continue
+                scanned+=1
+                if scanned>4096 or time.monotonic()>deadline:return result('uncertain','scan-limit')
+                item=proc/entry.name
+                try:
+                    if item.stat().st_uid!=os.getuid():continue
+                    comm,status,start=identity(item)
+                    if status in ('Z','X'):continue
+                    try:
+                        with (item/'environ').open('rb') as handle:blob=handle.read(262145)
+                    except PermissionError:
+                        helper_exe=Path(os.readlink(item/'exe')).name
+                        if comm not in PROCESS_HELPERS or helper_exe not in PROCESS_HELPERS:uncertain.add('process-permission')
+                        continue
+                    if len(blob)>262144:uncertain.add('environment-limit');continue
+                    fields=blob.split(b'\0'); ids={}
+                    for field in fields:
+                        key,_,value=field.partition(b'=')
+                        if key in (b'SteamAppId',b'SteamGameId'):ids[key]=value
+                    if appid.encode() not in ids.values():continue
+                    if any(v not in (appid.encode(),b'0',b'') for v in ids.values()):uncertain.add('conflicting-app-id');continue
+                    after=identity(item)
+                    if after[1] in ('Z','X'):continue
+                    if (comm,start)!=(after[0],after[2]):uncertain.add('process-changed');continue
+                    exe=Path(os.readlink(item/'exe')).name
+                    if comm in PROCESS_HELPERS or exe in PROCESS_HELPERS or re.fullmatch(r'python(?:[0-9]+(?:\.[0-9]+)?)?|bash|sh|proton',exe):
+                        uncertain.add('helper-app-id');continue
+                    if exe in ('wine','wine64','wine-preloader','wine64-preloader'):
+                        with (item/'cmdline').open('rb') as handle:args=handle.read(16384).split(b'\0')
+                        if any(a.replace(b'\\',b'/').rsplit(b'/',1)[-1].decode(errors='replace').lower() in PROCESS_HELPERS for a in args):
+                            uncertain.add('wine-helper');continue
+                        if not any(a.lower().endswith(b'.exe') and b'wine' not in a.lower() for a in args):
+                            uncertain.add('wine-identity');continue
+                    return result('running','exact-app-process')
+                except FileNotFoundError:continue  # normal process exit, not evidence of a game
+                except (OSError,ValueError):uncertain.add('process-unreadable')
+    except OSError:return result('uncertain','proc-unavailable')
+    return result('uncertain',sorted(uncertain)[0]) if uncertain else result('closed','no-app-process')
+
+
+def game_is_running(appid):
+    """Compatibility safety predicate: uncertainty blocks mutation, not advice."""
+    return game_running_state(appid)['state']!='closed'
 
 @game_transaction
 def apply_profile(game, mode, force=False, allowed_files=None, context=None, expected_hashes=None):
@@ -1082,8 +1141,9 @@ def apply_profile(game, mode, force=False, allowed_files=None, context=None, exp
         files = [(p, a) for p, a in files if str(p) in allowed_files]
     if not files:
         return {'status': 'unsupported', 'count': 0}
-    if game_is_running(game['appid']):
-        return {'status': 'running', 'count': 0}
+    visibility=game_running_state(game['appid'])
+    if visibility['state']!='closed':
+        return {'status':visibility['state'],'count':0}
     previous = read_json(STATE, {})
     if not isinstance(previous, dict): return {'status': 'error', 'count': 0}
     changed = 0
@@ -1106,6 +1166,8 @@ def apply_profile(game, mode, force=False, allowed_files=None, context=None, exp
                 if (not saved_backup.is_file() or saved_backup.is_symlink()
                         or not saved_backup.resolve().is_relative_to(BACKUPS.resolve())):
                     raise ValueError('Original backup missing or unsafe; no changes made.')
+            if old.get('backup_sha256') and backup_digest(saved_backup)!=old['backup_sha256']:
+                raise ValueError('Original backup changed; refusing to apply.')
             if old.get('after_sha') and sha(original) != old['after_sha']:
                 # A game or user changed these settings since our last edit.
                 # Never override this change during automatic syncing.
@@ -1124,7 +1186,7 @@ def apply_profile(game, mode, force=False, allowed_files=None, context=None, exp
             backup = backdir / (rel_id + '.original.ini')
             if not old and backup.exists():
                 backup = backdir / (rel_id + '.' + secrets.token_hex(6) + '.original.ini')
-            backdir.mkdir(parents=True, exist_ok=True)
+            backdir.mkdir(parents=True, exist_ok=True,mode=0o700)
             if not backup.exists():
                 shutil.copy2(path, backup)
                 backups += 1
@@ -1139,9 +1201,9 @@ def apply_profile(game, mode, force=False, allowed_files=None, context=None, exp
                     f.write(updated.encode('utf-8')); f.flush(); os.fsync(f.fileno())
                 os.chmod(temp, path.stat().st_mode & 0o777)
                 if game_is_running(game['appid']) or sha(safe_read_text(path)) != sha(original):
-                    raise ValueError('Game started or settings changed during apply; file left alone.')
+                    raise ValueError('Game state or settings changed during apply; file left alone.')
                 previous[rel_id] = {'appid': game['appid'], 'file': str(path),
-                                    'backup': old.get('backup', str(backup)), 'mode': mode, 'after_sha': sha(updated)}
+                                    'backup': old.get('backup', str(backup)), 'backup_sha256':backup_digest(managed_backup), 'before_sha':sha(original), 'mode': mode, 'after_sha': sha(updated)}
                 atomic_json(STATE, previous)
                 temp.replace(path)
             finally:
@@ -1159,8 +1221,9 @@ def apply_profile(game, mode, force=False, allowed_files=None, context=None, exp
 
 @game_transaction
 def restore_game(appid):
-    if game_is_running(appid):
-        return 'Game appears to be running. Close it before restoring.'
+    visibility=game_running_state(appid)
+    if visibility['state']=='uncertain':return 'Cannot confirm game closed. Settings left unchanged.'
+    if visibility['state']=='running':return 'Game appears to be running. Close it before restoring.'
     cfg = config()
     cfg['approved'].pop(appid, None)
     cfg['approved_files'].pop(appid, None)
@@ -1168,12 +1231,15 @@ def restore_game(appid):
     write_config(cfg)
     state = read_json(STATE, {})
     if not isinstance(state, dict): return 'Invalid backup state. No files changed.'
+    game=next((g for g in installed_games() if g['appid']==appid),None)
+    allowed={str(p) for p,_ in adapter_files(game)} if game else set()
     n = 0
     for k, v in list(state.items()):
         if not isinstance(v, dict) or v.get('appid') != appid:
             continue
         if not isinstance(v.get('file'), str) or not isinstance(v.get('backup'), str): continue
         path = Path(v['file'])
+        if str(path) not in allowed:continue
         backup = Path(v['backup'])
         if (not backup.is_file() or not path.is_file() or path.is_symlink() or backup.is_symlink()
                 or any(p.is_symlink() for p in path.parents)
@@ -1181,6 +1247,8 @@ def restore_game(appid):
             continue
         try:
             current = safe_read_text(path)
+            if v.get('backup_sha256') and backup_digest(backup)!=v['backup_sha256']:
+                log('RESTORE SKIP corrupt backup');continue
             if sha(current) != v.get('after_sha'):
                 log('RESTORE SKIP modified after DeckPilot: ' + str(path))
                 continue  # never overwrite user/game changes
@@ -1376,14 +1444,15 @@ def redact_diagnostic(text):
     return text[:500]
 
 
-def diagnostic_report():
+def diagnostic_report(include_process=False):
     """Aggregate technical indicators only; no raw config, library paths or keys."""
     games = installed_games()
     cfg = config()
     file_count = sum(bool(adapter_files(g)) for g in games)
     state = read_json(STATE, {})
     try:
-        raw_log = LOG.read_text(encoding='utf-8', errors='replace')[-100_000:]
+        with LOG.open('rb') as handle:
+            handle.seek(0,2);handle.seek(max(0,handle.tell()-100_000));raw_log=handle.read(100_000).decode('utf-8',errors='replace')
     except OSError:
         raw_log = ''
     lines = [redact_diagnostic(line) for line in raw_log.splitlines()[-180:]]
@@ -1395,6 +1464,7 @@ def diagnostic_report():
     except OSError:
         os_name = 'Linux'
     return {
+        **({'process_checks':[game_running_state(g['appid']) for g in games[:8]]} if include_process else {}),
         'format': 1, 'app': 'DeckPilot TV', 'version': VERSION, 'build_id': BUILD_ID,
         'created_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
         'operating_system': os_name[:120], 'kernel': platform.release()[:120],
@@ -1414,7 +1484,7 @@ def diagnostic_report():
 
 
 def make_diagnostic_zip(report=None):
-    report = report if report is not None else diagnostic_report()
+    report = report if report is not None else diagnostic_report(include_process=True)
     out = BytesIO()
     with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr('DeckPilot-Diagnostics.json', json.dumps(report, indent=2, ensure_ascii=False) + '\n')
@@ -1427,7 +1497,7 @@ def make_diagnostic_zip(report=None):
 
 
 def save_diagnostic_zip():
-    REPORTS.mkdir(parents=True, exist_ok=True)
+    REPORTS.mkdir(parents=True, exist_ok=True,mode=0o700)
     name = 'DeckPilot-Latest-Local.zip'  # replace instead of accumulating ZIP files
     dest = REPORTS / name
     dest.write_bytes(make_diagnostic_zip())
@@ -1482,9 +1552,9 @@ def cloud_fingerprint(report):
     return sha(json.dumps(stable, ensure_ascii=False, sort_keys=True))
 
 
-def cloud_status():
+def cloud_status(check_connection=True):
     cfg = cloud_config()
-    ready, message = drive_ready()
+    ready,message=drive_ready() if check_connection else (False,'Connection not checked during screen refresh.')
     return {'enabled': cfg['enabled'], 'ready': ready, 'connection': message,
             'folder': CLOUD_FOLDER, 'file': CLOUD_FILENAME,
             'last_success_utc': (dt.datetime.fromtimestamp(cfg['last_success'], dt.timezone.utc).isoformat()
@@ -1543,7 +1613,7 @@ def upload_cloud_report(force=False, report=None):
         cfg['last_status'] = reason
         cloud_state_update(last_status=cfg['last_status'])
         return reason
-    report = report if report is not None else diagnostic_report()
+    report = report if report is not None else diagnostic_report(include_process=True)
     fingerprint = cloud_fingerprint(report)
     error_fingerprint = sha(json.dumps(report.get('errors', []), sort_keys=True))
     now = time.time()
@@ -1555,7 +1625,7 @@ def upload_cloud_report(force=False, report=None):
     if not force and not changed and elapsed < 86400:
         return 'No new changes to upload.'
     binary = rclone_binary()
-    REPORTS.mkdir(parents=True, exist_ok=True)
+    REPORTS.mkdir(parents=True, exist_ok=True,mode=0o700)
     path = None
     try:
         with tempfile.NamedTemporaryFile(prefix='deckpilot-cloud-', suffix='.zip', dir=REPORTS,
@@ -1639,10 +1709,10 @@ def state_for_ui():
                        'supported': has_adapter, 'metrics': metrics, 'hint': mode_hint(mode, metrics)})
     return {'version': VERSION, 'build_id': BUILD_ID, 'schema_version': 2, 'context': cfg['context'], 'profiles': cfg['profiles'],
             'measurements_enabled': cfg['measurements_enabled'],
-            'launch_prompt': {'protocol': 1, 'enabled': cfg['play_assistant_enabled'], 'available': True, 'native_play': False, 'method': 'deckpilot-button', 'dismissed': cfg['launch_dismissed'], 'reason': 'Opt-in DeckPilot Play button only. Native Steam Play is untouched.'},
+            'launch_prompt': {'protocol': 2, 'enabled': cfg['play_assistant_enabled'], 'available': True, 'native_play': False, 'method': 'deckpilot-button', 'dismissed': cfg['launch_dismissed'], 'reason': 'Opt-in DeckPilot Play button only. Native Steam Play is untouched.'},
             'enabled': cfg['enabled'], 'default': cfg['default'], 'games': result, 'count': len(result),
             'supported': sum(1 for g in result if g['supported']),
-            'vrr_capability': external_vrr_capability(), 'display': display_diagnostics(), 'saved_games': cfg['games'], 'cloud': cloud_status()}
+            'vrr_capability': external_vrr_capability(), 'display': display_diagnostics(), 'saved_games': cfg['games'], 'cloud': cloud_status(check_connection=False)}
 
 
 WEB = r'''<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -1850,16 +1920,22 @@ def run_server():
 
 def main():
     parser = argparse.ArgumentParser(description='DeckPilot TV: Steam Deck OLED docked game optimiser')
-    parser.add_argument('command', choices=['serve', 'scan', 'apply', 'restore', 'status', 'diagnose', 'export', 'cloud-status', 'cloud-upload', 'cloud-enable', 'cloud-disable', 'update-status', 'set-mode', 'plugin-state', 'check-github', 'install-update', 'rollback-update', 'search', 'research', 'preview', 'approve', 'set-context', 'checkup', 'measurements-enable', 'measurements-disable', 'play-enable', 'play-disable', 'play-plan', 'play-preview', 'play-approve', 'play-dismiss', 'play-reset'])
+    parser.add_argument('command', choices=['serve', 'scan', 'apply', 'restore', 'status', 'diagnose', 'export', 'cloud-status', 'cloud-upload', 'cloud-enable', 'cloud-disable', 'update-status', 'set-mode', 'plugin-state', 'check-github', 'install-update', 'rollback-update', 'search', 'research', 'preview', 'approve', 'set-context', 'checkup', 'measurements-enable', 'measurements-disable', 'play-enable', 'play-disable', 'play-plan', 'play-preview', 'play-approve', 'play-dismiss', 'play-reset','process-status'])
     parser.add_argument('appid', nargs='?')
     parser.add_argument('--mode', choices=sorted(MODES))
     parser.add_argument('--preview-token', default='')
+    parser.add_argument('--launch-protocol',type=int,choices=[1,2],default=1)
     parser.add_argument('--context', choices=sorted(CONTEXTS))
     args = parser.parse_args()
+    if args.command=='process-status':
+        appid=steam_id(args.appid)
+        if args.context and (args.context!=config()['context'] or not any(g['appid']==appid for g in installed_games())):
+            print(json.dumps({'state':'uncertain','reason':'selection-changed'}));return
+        print(json.dumps(game_running_state(appid)));return
     if args.command in ('play-enable','play-disable','play-plan','play-preview','play-approve','play-dismiss','play-reset'):
         try:
             if args.command in ('play-enable','play-disable'): result = set_play_assistant(args.command=='play-enable')
-            elif args.command == 'play-plan': result = prepare_play(args.appid, args.context)
+            elif args.command == 'play-plan': result = prepare_play(args.appid, args.context,args.launch_protocol)
             elif args.command == 'play-preview': result = play_preview(args.appid, args.mode, args.context)
             elif args.command == 'play-approve': result = play_approve(args.appid, args.mode, args.preview_token, args.context)
             else: result = dismiss_play_advice(args.appid, args.command=='play-dismiss')

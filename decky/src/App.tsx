@@ -141,7 +141,7 @@ export function DeckPilotApp(){
       </PanelSection>
       <PanelSection title="Your choice">{modeButtons()}</PanelSection>
       <PanelSection>
-        {modern&&!offline&&info.launch_prompt?.enabled&&info.launch_prompt.protocol===1&&info.games?.some(g=>g.appid===game.appid)&&bigButton('Play with DeckPilot',()=>void launchController.start({appid:game.appid,name:game.name,context,installed:true,enabled:true}),'Opt-in cached advice before launching.',checkup?.status==='running')}
+        {modern&&!offline&&info.launch_prompt?.enabled&&info.launch_prompt.protocol===2&&info.games?.some(g=>g.appid===game.appid)&&bigButton('Play with DeckPilot',()=>void launchController.start({appid:game.appid,name:game.name,context,installed:true,enabled:true}),'Opt-in cached advice before launching.',checkup?.status==='running')}
         {bigButton('Review & Apply',()=>void run(async()=>{
           const p=await api.preview(game.appid,mode,context);
           if(p.status==='preview'&&p.token&&!p.error){setReview({preview:p,mode,context,appid:game.appid});setDetail('review');}
@@ -190,11 +190,12 @@ export function DeckPilotApp(){
 
     {screen==='advanced'&&<>
       {game&&<PanelSection title={game.name}>
+        {row(<p className="dp-small">Game state: {checkup?.process?.state||'not checked'} · {checkup?.process?.reason||'Refresh Checkup for evidence'}</p>)}
         {checkup?.can_restore&&bigButton('Restore game settings',()=>{setScreen('game');setDetail('restore');})}
         {bigButton('Refresh Game Checkup',()=>void run(refreshGame))}
       </PanelSection>}
       <PanelSection title="Play-time recommendations">
-        {info.launch_prompt?.protocol===1?<>
+        {info.launch_prompt?.protocol===2?<>
           {confirm==='play'?<>
             {row(<p>Enable the experimental DeckPilot Play button? It uses cached advice. Steam’s own Play button stays unchanged. Hardware launch behavior still needs testing.</p>)}
             {bigButton('Enable Play recommendations',()=>void run(async()=>{setConfirm(undefined);return api.playAssistant(true);}))}
@@ -221,7 +222,7 @@ export function DeckPilotApp(){
       </PanelSection>
       <PanelSection title="Display & App">
         {row(<p className="dp-small">VRR capability: {info.display?.vrr_capability||'unknown'}. VRR enabled: {info.display?.vrr_enabled||'unknown'}. {info.display?.note}</p>)}
-        {row(<p className="dp-small">App {info.version||'unknown'} · Plugin {info.plugin_version||'0.8.3-preview.2'}. {info.update?.github?.message}</p>)}
+        {row(<p className="dp-small">App {info.version||'unknown'} · Plugin {info.plugin_version||'0.8.3-preview.3'}. {info.update?.github?.message}</p>)}
         {bigButton('Refresh status',()=>void run(async()=>{await refresh();return {message:'Refreshed.'};}))}
       </PanelSection>
     </>}

@@ -149,3 +149,24 @@ test('cancelling a pending dismissal invalidates its late launch callback',async
  await controller.start(target);const remember=controller.dontAskAgain();controller.cancel();waiting.resolve({ok:true});await remember;
  expect(controller.getSnapshot().phase).toBe('idle');expect(calls.some(c=>c.name==='launch'||c.name==='approve')).toBe(false);
 });
+
+test('uncertain evidence never dispatches, applies or remembers dismissal',async()=>{
+ const {controller,calls}=fixture({plan:async()=>({...plan,status:'uncertain',can_apply:false})});
+ await controller.start(target);await controller.playWithoutChanges();await controller.dontAskAgain();await controller.review();
+ expect(controller.getSnapshot().phase).toBe('prompt');expect(calls).toEqual([]);
+});
+
+test('fresh pre-dispatch state blocks a game that starts while prompt is open',async()=>{
+ const {controller,calls}=fixture({verify:async()=>({state:'running'})});await controller.start(target);await controller.playWithoutChanges();
+ expect(controller.getSnapshot().phase).toBe('error');expect(calls.some(c=>c.name==='launch')).toBe(false);
+});
+test('pre-dispatch visibility failure never auto-launches or duplicates',async()=>{
+ const {controller,calls}=fixture({verify:async()=>{throw Error('offline');}});await controller.start(target);await controller.playWithoutChanges();await controller.playWithoutChanges();
+ expect(calls.some(c=>c.name==='launch')).toBe(false);
+});
+
+test('bridge-reported uncertain mutation never launches or permits controlled retry',async()=>{
+ const {controller,calls}=fixture({approve:async()=>({ok:false,uncertain:true,error:'Apply result unknown'})});
+ await controller.start(target);await controller.review();await controller.approve();await controller.playWithoutChanges();
+ expect(controller.getSnapshot().uncertain).toBe(true);expect(calls.some(c=>c.name==='launch')).toBe(false);
+});

@@ -6,6 +6,7 @@ type SteamApps={RunGame?:(id:string,options:string,launchOption:number,source:nu
 const steamApps=()=> (globalThis as unknown as {SteamClient?:{Apps?:SteamApps}}).SteamClient?.Apps;
 export const launchController=new LaunchController({
   plan:api.playPlan,preview:api.playPreview,approve:api.playApprove,dismiss:api.dismissPlay,
+  verify:api.processState,
   available:()=>typeof steamApps()?.RunGame==='function',
   launch:(id)=>{
     const apps=steamApps();if(!apps?.RunGame)throw Error('Steam launch API unavailable');

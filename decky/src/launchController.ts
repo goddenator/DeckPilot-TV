@@ -9,6 +9,7 @@ export interface LaunchPorts {
   preview:(id:string,mode:Mode,context:Profile)=>Promise<Preview>;
   approve:(id:string,mode:Mode,token:string,context:Profile)=>Promise<Result>;
   dismiss:(id:string,value:boolean)=>Promise<Result>;
+  verify?:(id:string,context:Profile)=>Promise<{state?:string}>;
   available:()=>boolean;
   launch:(id:string)=>void|Promise<void>;
   now?:()=>number;
@@ -53,6 +54,7 @@ export class LaunchController {
       const plan=await this.read(this.ports.plan(captured.appid,captured.context));
       if(!this.current(generation))return;
       if(plan.status==='disabled'||plan.status==='dismissed'){await this.dispatch(generation);return;}
+      if(plan.status==='uncertain'){this.update({phase:'prompt',target:captured,plan:{...plan,can_apply:false},mode:'balanced',message:plan.message||'Cannot confirm game closed. Use Steam’s Play/Resume button.'});return;}
       if(plan.status==='running'||plan.status==='not-installed'||plan.status==='profile-changed'){
         this.update({phase:'error',target:captured,message:plan.error||'Use Steam to play or resume this game.'});return;
       }
@@ -88,6 +90,7 @@ export class LaunchController {
       // The bridge confirms completion/termination before returning a result.
       const result=await this.ports.approve(state.target.appid,state.mode,state.preview.token,state.target.context);
       if(!this.current(generation))return;
+      if(result.uncertain){this.uncertainMutations.add(state.target.appid);this.update({...state,phase:'error',uncertain:true,message:result.error||'Apply result unknown. Check settings and use Steam.'});return;}
       if(result.ok!==true||result.error){this.update({...state,phase:'prompt',preview:undefined,message:result.error||result.message||'Settings were not applied. Review again or play without further changes.'});return;}
       await this.dispatch(generation,'Approved settings applied. Launch requested.');
     }catch{
@@ -96,10 +99,11 @@ export class LaunchController {
     }finally{this.mutationPending=false;}
   }
   async playWithoutChanges(){
+    if(this.state.plan?.status==='uncertain')return;
     if(this.state.phase==='prompt'||this.state.phase==='review')await this.dispatch(this.generation);
   }
   async dontAskAgain(){
-    const state=this.state;if(state.phase!=='prompt'||!state.target)return;
+    const state=this.state;if(state.phase!=='prompt'||!state.target||state.plan?.status==='uncertain')return;
     const generation=this.generation;this.update({...state,phase:'remembering',message:'Saving your choice…'});
     let message='Advice hidden for this game. Launch requested without changes.';
     try{const result=await this.read(this.ports.dismiss(state.target.appid,true));if(result.ok!==true||result.error)message='Could not remember your choice. Launch requested without changes.';}
@@ -110,9 +114,13 @@ export class LaunchController {
     if(!this.current(generation)||!this.state.target||['launching','launched'].includes(this.state.phase))return;
     const state=this.state;const target=state.target!;
     if(!this.available()){this.update({...state,phase:'error',message:'Steam launch API unavailable. Use Steam’s Play button.'});return;}
-    this.attempts.set(target.appid,(this.ports.now??Date.now)());
     // Mark before RunGame: a synchronous re-entry or repeated press cannot dispatch twice.
     this.update({...state,phase:'launching',message:'Requesting launch…'});
+    if(this.ports.verify){
+      try{const evidence=await this.read(this.ports.verify(target.appid,target.context));if(!this.current(generation))return;if(evidence.state!=='closed')throw Error('Not confirmed closed');}
+      catch{if(this.current(generation))this.update({...state,phase:'error',message:'Cannot confirm game closed. Use Steam’s Play/Resume button.'});return;}
+    }
+    this.attempts.set(target.appid,(this.ports.now??Date.now)());
     try{
       await this.read(Promise.resolve(this.ports.launch(target.appid)));
       if(this.current(generation))this.update({...state,phase:'launched',preview:undefined,message});

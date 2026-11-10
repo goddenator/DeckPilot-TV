@@ -1,6 +1,6 @@
 import { test,expect,Page } from '@playwright/test';
 
-type Options={enabled?:boolean;unsupported?:boolean;dismissed?:boolean;backendDown?:boolean;failApply?:boolean;launchThrows?:boolean;noSteam?:boolean;slowPlan?:boolean};
+type Options={enabled?:boolean;unsupported?:boolean;dismissed?:boolean;backendDown?:boolean;failApply?:boolean;launchThrows?:boolean;noSteam?:boolean;uncertain?:boolean;slowPlan?:boolean};
 async function setup(page:Page,options:Options={}){
  await page.addInitScript(({noSteam,launchThrows})=>{
   const w=window as any;w.steamCalls=[];
@@ -11,7 +11,7 @@ async function setup(page:Page,options:Options={}){
   }};
   if(noSteam)delete w.SteamClient.Apps.RunGame;
  },options);
- const state:any={schema_version:2,version:'0.8.2',context:'docked',default:'balanced',profiles:{docked:{default:'balanced',games:{}},handheld:{default:'balanced',games:{}}},games:[{appid:'1234',name:'Test Game',supported:!options.unsupported}],launch_prompt:{protocol:1,available:true,enabled:options.enabled??true,native_play:false,dismissed:options.dismissed?['1234']:[]}};
+ const state:any={schema_version:2,version:'0.8.2',context:'docked',default:'balanced',profiles:{docked:{default:'balanced',games:{}},handheld:{default:'balanced',games:{}}},games:[{appid:'1234',name:'Test Game',supported:!options.unsupported}],launch_prompt:{protocol:2,available:true,enabled:options.enabled??true,native_play:false,dismissed:options.dismissed?['1234']:[]}};
  const calls:{name:string;args:any[]}[]=[];
  await page.route('**/rpc',async route=>{
   const {name,args}=route.request().postDataJSON();calls.push({name,args});let result:any={ok:true};
@@ -24,6 +24,8 @@ async function setup(page:Page,options:Options={}){
    if(options.slowPlan)await new Promise(r=>setTimeout(r,250));
    result=state.launch_prompt.dismissed.includes('1234')?{ok:true,status:'dismissed',appid:'1234'}:{ok:true,status:'prompt',appid:'1234',context:'docked',can_apply:!options.unsupported,report_count:1,sources:['ShareDeck'],stale:true,display_match:true,resolution:'1280x800',fps:'40 FPS',fps_kind:'target, not measured FPS',recommendation:{mode:'balanced',confidence:'low',reason:'Saved OLED report; TV unverified.',note:'Starting point'}};
   }
+  if(name==='play_plan'&&options.uncertain)result={ok:true,status:'uncertain',appid:'1234',context:'docked',can_apply:false,message:'Cannot confirm game closed. Use Steam’s Play/Resume button.'};
+  if(name==='process_state')result={state:'closed'};
   if(name==='play_preview')result={ok:true,status:'preview',token:'exact-token',files:[{adapter:'unreal',file:'GameUserSettings.ini',manual_changes:false,changes:[{key:'ResolutionSizeX',before:'800',after:'1920'},{key:'ResolutionSizeY',before:'600',after:'1080'}]}]};
   if(name==='play_approve')result=options.failApply?{ok:false,error:'Preview changed. No changes applied.'}:{ok:true,message:'Backed up and applied.'};
   await route.fulfill({json:result});
@@ -122,4 +124,11 @@ test('keyboard navigation preserves mode focus and Cancel abandons reviewed Play
  await expect(page.getByText('ResolutionSizeX: 800 → 1920')).toBeVisible();
  await button(page,'Cancel').focus();await page.keyboard.press('Enter');await expect(page.getByRole('heading',{name:'Game Checkup'})).toBeVisible();
  expect(calls.some(c=>c.name==='play_approve')).toBe(false);expect(await steamCalls(page)).toEqual([]);
+});
+
+test('uncertain process visibility offers advice and native fallback without apply or dispatch',async({page})=>{
+ const {calls}=await setup(page,{uncertain:true});await button(page,'Play with DeckPilot').click();
+ await expect(page.getByRole('status')).toContainText('Cannot confirm game closed');
+ for(const name of ['Apply & Play','Play Without Changes',"Don't Ask Again"])await expect(button(page,name)).toHaveCount(0);
+ await button(page,'Cancel').click();expect(await steamCalls(page)).toEqual([]);expect(calls.some(c=>c.name==='play_approve')).toBe(false);
 });

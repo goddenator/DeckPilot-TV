@@ -151,7 +151,7 @@ class GameFixture(IsolatedData):
         self.raw='[/Script/Engine.GameUserSettings]\nResolutionSizeX=800\nResolutionSizeY=600\nOther=preserve\n'
         self.path.write_text(self.raw)
         self.stack.enter_context(patch.object(d,'installed_games',return_value=[self.game]))
-        self.running=self.stack.enter_context(patch.object(d,'game_is_running',return_value=False))
+        self.running=self.stack.enter_context(patch.object(d,'game_running_state',return_value={'state':'closed'}))
 
 
 
@@ -179,9 +179,9 @@ class AdapterIntegrationTests(GameFixture):
         self.path.write_text(self.raw+'New=mine\n')
         self.assertFalse(d.approve_profile('1234','graphics',p['token'])['ok'])
         p=d.preview_profile('1234','graphics')
-        self.running.return_value=True
+        self.running.return_value={'state':'running'}
         self.assertFalse(d.approve_profile('1234','graphics',p['token'])['ok'])
-        self.running.return_value=False
+        self.running.return_value={'state':'closed'}
         d.approve_profile('1234','graphics',p['token'])
         manual=self.path.read_text().replace('1920','1000');self.path.write_text(manual)
         p=d.preview_profile('1234','balanced')

@@ -1,4 +1,4 @@
-# DeckPilot TV — v0.8.3-preview.2 development
+# DeckPilot TV — v0.8.3-preview.3 development
 
 A free, cautious Steam Deck OLED optimisation assistant with three choices: **Best Graphics**, **Best Performance**, and **Balanced**. This is an unreleased development build on PR #3; nothing is merged or published.
 
@@ -18,6 +18,8 @@ Independent Deck Settings / deckverified.games, ShareDeck and SteamDeckHQ report
 **Stable / Preview updates:** Settings → Updates verifies paired app/plugin builds, asks before installing, saves rollback snapshots and hands plugin installation to Decky’s supported URL installer. The first approved release and Steam Deck validation are still pending. See [update usage, publication approval and recovery](docs/UPDATES.md).
 
 See [app usage](app/README.md), [Decky usage](decky/README.md), and [research provenance](docs/RESEARCH.md).
+
+See the [Preview.3 reliability audit, fixed defects, residual risks and controller-only device checklist](docs/RELIABILITY-AUDIT.md).
 
 ## Development checks
 

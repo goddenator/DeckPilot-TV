@@ -68,10 +68,10 @@ class PlayPrototypeTests(GameFixture):
     def test_disabled_running_wrong_context_or_changed_file_cannot_apply(self):
         d.set_play_assistant(True);p=d.play_preview('1234','graphics')
         d.set_play_assistant(False);self.assertFalse(d.play_approve('1234','graphics',p['token'])['ok'])
-        d.set_play_assistant(True);self.running.return_value=True
+        d.set_play_assistant(True);self.running.return_value={'state':'running'}
         self.assertEqual(d.prepare_play('1234')['status'],'running')
         self.assertFalse(d.play_approve('1234','graphics',p['token'])['ok'])
-        self.running.return_value=False;self.path.write_text(self.raw+'User=keep\n')
+        self.running.return_value={'state':'closed'};self.path.write_text(self.raw+'User=keep\n')
         self.assertFalse(d.play_approve('1234','graphics',p['token'])['ok'])
         self.assertNotIn('1920',self.path.read_text());self.assertIn('User=keep',self.path.read_text())
         d.set_context('handheld');self.assertEqual(d.prepare_play('1234','docked')['status'],'profile-changed')
@@ -92,7 +92,7 @@ class PlayPrototypeTests(GameFixture):
         data=self.root/'cli-data'
         bootstrap="""import deckpilot as d
 # The integration fixture has no real game process. All network use is forbidden.
-d.game_is_running=lambda appid: False
+d.game_running_state=lambda appid: {'state':'closed'}
 def blocked(*args,**kwargs): raise AssertionError('Network on controlled Play path')
 d.public_get=d.permitted_get=blocked
 d.main()

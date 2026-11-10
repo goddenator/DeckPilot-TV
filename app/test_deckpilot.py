@@ -61,7 +61,7 @@ class TestDeckPilot(unittest.TestCase):
             path.parent.mkdir(parents=True)
             text = '[/Script/Engine.GameUserSettings]\nResolutionSizeX=800\nResolutionSizeY=600\n'
             path.write_text(text)
-            with patch.object(d,'BASE',base/'data'),patch.object(d,'CONFIG',base/'data/config.json'),patch.object(d,'STATE',base/'data/state.json'),patch.object(d,'BACKUPS',base/'data/backups'),patch.object(d,'LOG',base/'data/deckpilot.log'),patch.object(d,'game_is_running',return_value=False):
+            with patch.object(d,'BASE',base/'data'),patch.object(d,'CONFIG',base/'data/config.json'),patch.object(d,'STATE',base/'data/state.json'),patch.object(d,'BACKUPS',base/'data/backups'),patch.object(d,'LOG',base/'data/deckpilot.log'),patch.object(d,'game_running_state',return_value={'state':'closed'}),patch.object(d,'installed_games',return_value=[g]):
                 outcome = d.apply_profile(g,'graphics')
                 self.assertEqual(outcome['status'],'applied')
                 self.assertIn('1920',path.read_text())
@@ -76,7 +76,7 @@ class TestDeckPilot(unittest.TestCase):
             path = d.proton_prefix(g['library'], g['appid'])/'MyGame/Saved/Config/Windows/GameUserSettings.ini'
             path.parent.mkdir(parents=True)
             path.write_text('[ScalabilityGroups]\nsg.ShadowQuality=1\n')
-            with patch.object(d,'BASE',base/'data'),patch.object(d,'CONFIG',base/'data/config.json'),patch.object(d,'STATE',base/'data/state.json'),patch.object(d,'BACKUPS',base/'data/backups'),patch.object(d,'LOG',base/'data/deckpilot.log'),patch.object(d,'game_is_running',return_value=False):
+            with patch.object(d,'BASE',base/'data'),patch.object(d,'CONFIG',base/'data/config.json'),patch.object(d,'STATE',base/'data/state.json'),patch.object(d,'BACKUPS',base/'data/backups'),patch.object(d,'LOG',base/'data/deckpilot.log'),patch.object(d,'game_running_state',return_value={'state':'closed'}),patch.object(d,'installed_games',return_value=[g]):
                 d.apply_profile(g,'graphics')
                 path.write_text(path.read_text().replace('sg.ShadowQuality=3','sg.ShadowQuality=0'))
                 result = d.apply_profile(g,'balanced')
