@@ -1,16 +1,25 @@
-# DeckPilot TV v0.8.0
+# DeckPilot TV — v0.8.1 development
 
-A cautious, free Steam Deck settings research tool with exactly three modes: **Best Graphics**, **Best Performance**, and **Balanced**. Select defaults and per-game preferences in Gaming Mode through Decky, including games that are not installed.
+A free, cautious Steam Deck OLED optimisation assistant with three choices: **Best Graphics**, **Best Performance**, and **Balanced**. This is an unreleased development build on PR #3; nothing is merged or published.
 
-Steam-wide name/App ID search uses the public Steam Store. Research verifies the selected App ID and independently queries Deck Settings / deckverified.games, ShareDeck, and SteamDeckHQ. Reports retain their source, date, device and available settings metadata. Unknown metadata stays unknown; handheld evidence and FPS targets are labelled. Community reports are advisory and never become executable commands or configuration instructions.
+The Decky interface has four simple screens:
 
-Local application supports existing compatible Unreal Engine configs and a limited native Linux Valheim resolution adapter. **Preview → approve → back up → apply** is required. Running games, unknown formats, symlinks, and later manual edits are skipped. Restore keeps newer user edits and stops automatic reapplication. No universal game adapter, TV performance guarantee, or hardware benchmark is claimed.
+- **Home** — choose how you want to play.
+- **Find Games** — your library or Steam-wide search, including uninstalled games.
+- **Game Details** — Game Checkup, three choices, review/approve local changes, and short community advice. Sources are optional.
+- **Settings** — select a separate Docked/Handheld profile and review updates. Restore, measurements and private diagnostics live under **Advanced**.
 
-See [app usage](app/README.md), [Decky usage](decky/README.md), and [source contracts, provenance and limits](docs/RESEARCH.md).
+Profiles are selected manually. Switching profiles never edits files. A concrete preview and approval are required before a compatible local adapter can apply settings, with backups first and newer user changes protected. Native Valheim and Hollow Knight support is limited to existing XML resolution settings; other unknown formats remain advisory. Saves and Steam launch options are untouched.
 
-## Development
+Independent Deck Settings / deckverified.games, ShareDeck and SteamDeckHQ reports retain provenance, evidence confidence, and offline cache labels. Balanced is a conservative starting recommendation, not a promise of optimal or achieved performance. Optional analysis reads existing attributable FPS/frame-time logs only; it does not start a recorder or automatically learn/apply settings.
 
-Python 3.10+ and Node 22+ are required. Use the existing checkout; no worktree is needed.
+**Steam Play interception is not active.** Research found a cancel/relaunch candidate that needs hardware testing. The desired prompt, safeguards, later work and manual Steam Deck checklist are in [the roadmap](docs/ROADMAP.md). Ordinary Steam Play remains untouched.
+
+See [app usage](app/README.md), [Decky usage](decky/README.md), and [research provenance](docs/RESEARCH.md).
+
+## Development checks
+
+Use the existing checkout; no worktree is needed. Python 3.10+ and Node 22+:
 
 ```bash
 python3 -m unittest discover -s app -v
@@ -19,12 +28,14 @@ cd decky
 npm ci
 npm run typecheck
 npm run build
+npx playwright install --with-deps chromium
+npm run test:ui
 cd ..
 python3 tools/package_release.py
 ```
 
-Packaging creates local v0.8.0 app and Decky ZIPs under `out/`; it never publishes. The app package deliberately retains the old updater's file allowlist so a trusted, approved update from v0.6 can install the new runtime. SHA256 checks, strict archive validation, explicit installation approval and rollback are retained. CI tests/builds development branches and PRs; only a separately pushed matching version tag can publish a release.
+UI tests render the production React app with Decky RPC/component shims in Chromium. They exercise navigation, keyboard focus, approval, errors, profiles and opt-ins; they do not validate Steam's actual controller focus engine. For an already installed Chromium, set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium` for `npm run test:ui`.
 
-Live source access was blocked by this cloud environment's outbound proxy. Public API schemas were inspected in upstream source and exercised with synthetic fixtures, but live source responses and actual Steam Deck OLED/dock/TV behavior still need validation. No release has been published by this change.
+Optional Desktop dashboard smoke test: `python3 tools/smoke_dashboard.py` (Python Playwright/Chromium required). It uses temporary data and an ephemeral port.
 
-Optional Desktop browser smoke test (Python Playwright and Chromium installed): `python3 tools/smoke_dashboard.py`. It uses temporary data and an ephemeral port, without touching an installed service.
+Packaging creates local app/plugin ZIPs in `out/` and never publishes. The old updater's app-file allowlist is retained. App installation requires approval and strict validation; online packages are rechecked against the approved GitHub digest. Plugin updates are never silently installed. CI runs Python, TypeScript, build and Decky browser tests for development branches/PRs; publishing remains a separate approved tag/release action.

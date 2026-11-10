@@ -28,6 +28,11 @@ jobs:
           npm run typecheck
           npm run build
           test -s dist/index.js
+      - name: Test Decky screens
+        working-directory: decky
+        run: |
+          npx playwright install --with-deps chromium
+          npm run test:ui
       - name: Assemble release assets
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then

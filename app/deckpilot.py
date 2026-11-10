@@ -32,7 +32,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = '0.8.0'
+VERSION = '0.8.1'
 APP = 'deckpilot-tv'
 PORT = 38647
 MODES = {'graphics', 'performance', 'balanced'}
@@ -117,22 +117,90 @@ def game_transaction(fn):
     return guarded
 
 
+CONTEXTS = {'docked', 'handheld'}
+HANDHELD_PRESETS = {
+    'graphics': {'x': 1280, 'y': 800, 'quality': 3, 'resolution_scale': 100},
+    'balanced': {'x': 1280, 'y': 800, 'quality': 2, 'resolution_scale': 100},
+    'performance': {'x': 1152, 'y': 720, 'quality': 1, 'resolution_scale': 100},
+}
+
+
+def profile_context(context=None, cfg=None):
+    context = context if context is not None else (cfg or config()).get('context', 'docked')
+    if not isinstance(context, str) or context not in CONTEXTS:
+        raise ValueError('Choose Docked or Handheld.')
+    return context
+
+
+def clean_modes(value):
+    if not isinstance(value, dict): return {}
+    return {k: v for k, v in value.items() if isinstance(k, str) and k.isascii()
+            and k.isdigit() and isinstance(v, str) and v in MODES}
+
+
 def config():
     obj = read_json(CONFIG, {})
     if not isinstance(obj, dict): obj = {}
-    games = obj.get('games', {})
-    if not isinstance(games, dict):
-        games = {}
-    return {'enabled': obj.get('enabled', False) is True,
-            'default': obj.get('default', DEFAULT_MODE) if isinstance(obj.get('default'), str) and obj.get('default') in MODES else DEFAULT_MODE,
-            'games': {str(k): v for k, v in games.items() if str(k).isascii() and str(k).isdigit() and isinstance(v, str) and v in MODES},
+    default = obj.get('default') if isinstance(obj.get('default'), str) and obj['default'] in MODES else DEFAULT_MODE
+    legacy = {'default': default, 'games': clean_modes(obj.get('games'))}
+    shadow = read_json(BASE/'profiles-v2.json', {})
+    if not isinstance(shadow, dict): shadow = {}
+    recovering = 'profiles' not in obj and isinstance(shadow.get('profiles'), dict)
+    profiles = {}
+    raw_profiles = shadow['profiles'] if recovering else obj.get('profiles', {})
+    for context in sorted(CONTEXTS):
+        raw = raw_profiles.get(context, {}) if isinstance(raw_profiles, dict) else {}
+        if not isinstance(raw, dict): raw = {}
+        mode = raw.get('default', default)
+        profiles[context] = {'default': mode if isinstance(mode, str) and mode in MODES else default,
+                             'games': clean_modes(raw.get('games', legacy['games']))}
+    context = obj.get('context', shadow.get('context', 'docked') if recovering else 'docked')
+    if not isinstance(context, str) or context not in CONTEXTS: context = 'docked'
+    if recovering and ('default' in obj or 'games' in obj):
+        profiles[context] = legacy
+    approved_context = obj.get('approved_context', {})
+    return {'enabled': obj.get('enabled') is True, 'context': context, 'profiles': profiles,
+            # Retain legacy aliases so an app rollback can still read current preferences.
+            'default': profiles[context]['default'], 'games': dict(profiles[context]['games']),
+            'measurements_enabled': obj.get('measurements_enabled', shadow.get('measurements_enabled', False) if recovering else False) is True,
+            'launch_prompts': False,  # no launch hook is registered; fail-open by construction
             'approved_files': {str(k): [p for p in paths if isinstance(p, str)][:40] for k, paths in obj.get('approved_files', {}).items() if isinstance(paths, list)} if isinstance(obj.get('approved_files'), dict) else {},
-            'approved': {str(k): v for k, v in obj.get('approved', {}).items() if str(k).isascii() and str(k).isdigit() and isinstance(v, str) and v in MODES} if isinstance(obj.get('approved'), dict) else {}}
+            'approved_context': {k: v for k, v in approved_context.items() if isinstance(v, str) and v in CONTEXTS} if isinstance(approved_context, dict) else {},
+            'approved': clean_modes(obj.get('approved'))}
 
 
-def effective_mode(appid, cfg=None):
+def effective_mode(appid, cfg=None, context=None):
     cfg = cfg or config()
-    return cfg['games'].get(str(appid), cfg['default'])
+    context = profile_context(context, cfg)
+    profile = cfg.get('profiles', {}).get(context, cfg)
+    return profile['games'].get(str(appid), profile['default'])
+
+
+def write_config(cfg):
+    active = cfg['profiles'][cfg['context']]
+    cfg['default'], cfg['games'] = active['default'], dict(active['games'])
+    # Keep inactive choices recoverable when a rollback writes the legacy schema.
+    atomic_json(BASE/'profiles-v2.json', {'context':cfg['context'], 'profiles':cfg['profiles'], 'measurements_enabled':cfg['measurements_enabled']})
+    atomic_json(CONFIG, cfg)
+
+
+@game_transaction
+def set_context(context):
+    context = profile_context(context)
+    cfg = config()
+    if cfg['context'] != context:
+        cfg['context'] = context
+        # Selecting a profile must never start changing files behind the UI.
+        cfg['approved'], cfg['approved_files'], cfg['approved_context'] = {}, {}, {}
+        write_config(cfg)
+    return {'ok': True, 'message': context.title() + ' profile selected. Preview before applying.'}
+
+
+@game_transaction
+def set_measurements(enabled):
+    if not isinstance(enabled, bool): raise ValueError('Expected an on/off choice.')
+    cfg = config(); cfg['measurements_enabled'] = enabled; write_config(cfg)
+    return {'ok': True, 'message': 'Existing FPS logs ' + ('enabled.' if enabled else 'disabled.')}
 
 
 # Public research is deliberately data-only. None of this text reaches adapters.
@@ -140,7 +208,7 @@ from html.parser import HTMLParser
 from urllib.robotparser import RobotFileParser
 from concurrent.futures import ThreadPoolExecutor, wait
 
-RESEARCH_AGENT = 'DeckPilot/0.8 (+public game-settings research)'
+RESEARCH_AGENT = 'DeckPilot/0.8.1 (+public game-settings research)'
 RESEARCH_HOSTS = {'store.steampowered.com', 'deckverified.games',
                   'www.sharedeck.games', 'sharedeck.games', 'steamdeckhq.com', 'github.com'}
 RESEARCH_LIMIT = 1024 * 1024
@@ -199,26 +267,49 @@ def public_get(url, deadline):
         return b''.join(parts).decode('utf-8')
 
 
-def research_cached(key, loader, ttl=RESEARCH_TTL):
-    """One bounded private cache; failures are briefly cached without raw errors."""
+from contextlib import contextmanager
+
+
+@contextmanager
+def research_guard():
+    with RESEARCH_LOCK:
+        mkdir()
+        with (BASE/'research.lock').open('a') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try: yield
+            finally: fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def research_cached(key, loader, ttl=RESEARCH_TTL, allow_stale=False):
+    """Bounded private cache. Retain verified reports for offline use up to 30 days."""
     path = BASE / 'research-cache.json'
-    with RESEARCH_LOCK:
+    with research_guard():
         cache = read_json(path, {})
-        if not isinstance(cache, dict): cache = {}
-        item = cache.get(key, {})
-        if isinstance(item, dict) and isinstance(item.get('at'), (int, float)) and 'value' in item and 0 <= time.time()-item['at'] < (min(ttl, 300) if isinstance(item['value'], dict) and item['value'].get('status') == 'unavailable' else ttl):
-            return item['value']
-    result = loader()
-    with RESEARCH_LOCK:
+        item = cache.get(key, {}) if isinstance(cache, dict) else {}
+        age = time.time() - item.get('at', 0) if isinstance(item, dict) and isinstance(item.get('at'), (int, float)) else float('inf')
+        if not isinstance(item, dict): item = {}
+        old = item.get('value')
+        valid = isinstance(old, (dict, list)) and 0 <= age <= 30*86400
+        short_failure = isinstance(old, dict) and (old.get('status') == 'unavailable' or old.get('blocked'))
+        if 'value' in item and 0 <= age < (min(ttl, 300) if short_failure else ttl):
+            if allow_stale and isinstance(old, dict): return {**old, 'cached': True, 'cache_age_s': round(age)}
+            return old
+    def fallback():
+        if isinstance(old, dict): return {**old, 'cached': True, 'stale': True, 'cache_age_s': round(age)}
+        return old
+    try: result = loader()
+    except (OSError, ValueError):
+        if allow_stale and valid and not short_failure: return fallback()
+        raise
+    if allow_stale and valid and not short_failure and isinstance(result, dict) and result.get('status') == 'unavailable':
+        return fallback()
+    with research_guard():
         cache = read_json(path, {})
         if not isinstance(cache, dict): cache = {}
         cache[key] = {'at': time.time(), 'value': result}
-        cache = dict(sorted(cache.items(), key=lambda kv: kv[1].get('at', 0)
-                            if isinstance(kv[1], dict) else 0)[-64:])
-        mkdir()
-        # This lock is separate from the game/config lock, so slow sources never block apply.
+        cache = {k:v for k,v in cache.items() if isinstance(v, dict) and isinstance(v.get('at'), (int,float))}
+        cache = dict(sorted(cache.items(), key=lambda kv: kv[1]['at'])[-64:])
         atomic_json(path, cache)
-        os.chmod(path, 0o600)
     return result
 
 
@@ -306,7 +397,7 @@ def steam_game(appid):
         if entry.get('success') is not True or str(item.get('steam_appid')) != appid or item.get('type') != 'game':
             raise ValueError('Steam did not verify this App ID as a game.')
         return {'appid': appid, 'name': clean_text(item.get('name'), 200), 'verified': True}
-    return research_cached('steam:' + appid, load)
+    return research_cached('steam:' + appid, load, allow_stale=True)
 
 
 def search_steam(query):
@@ -327,7 +418,7 @@ def search_steam(query):
                 result.append({'appid': appid, 'name': clean_text(item.get('name'), 200),
                                'verified': False})  # appdetails is checked on selection, never by name alone
             return result
-        return {'ok': True, 'games': research_cached('search:' + query.casefold(), load)}
+        return {'ok': True, 'games': research_cached('search:' + query.casefold(), load, allow_stale=True)}
     except (OSError, ValueError, KeyError, TypeError, RecursionError):
         return {'ok': False, 'games': [], 'error': 'Steam search unavailable or invalid response. Try again later; installed games and saved preferences still work.'}
 
@@ -469,12 +560,13 @@ def source_research(source, url, appid):
             return {'source': source, 'url': url, 'status': 'unavailable', 'reports': [],
                     'message': 'Source unavailable, denied automated access, timed out, or returned an unsupported format.'}
     # Keep successes for six hours and failures for five minutes.
-    result = dict(research_cached(source + ':' + appid, load, RESEARCH_TTL))
+    result = dict(research_cached(source + ':' + appid, load, RESEARCH_TTL, allow_stale=True))
     result['page_url'] = ('https://deckverified.games/app/' + appid if source.startswith('Deck Settings') else 'https://sharedeck.games/apps/' + appid if source == 'ShareDeck' else 'https://steamdeckhq.com/')
     return result
 
 
-def research_game(appid):
+def research_game(appid, context=None):
+    context = profile_context(context)
     try: game = steam_game(appid)
     except (OSError, ValueError, KeyError, TypeError, RecursionError):
         return {'ok': False, 'error': 'Cannot verify this game with Steam. No similarly named game will be substituted.', 'sources': [], 'reports': []}
@@ -496,9 +588,9 @@ def research_game(appid):
             future.cancel()
             results.append({'source': source, 'url': url, 'status': 'timeout', 'reports': []})
     pool.shutdown(wait=False, cancel_futures=True)
-    reports = [report for result in results for report in result['reports']]
-    reports.sort(key=lambda r: (r['display_context'] == 'docked', 'OLED' in r['device'].upper()), reverse=True)
-    return {'ok': True, 'game': game, 'sources': results, 'reports': reports,
+    reports = [{**report, 'stale': result.get('stale', False), 'cached': result.get('cached', False)} for result in results for report in result['reports']]
+    reports.sort(key=lambda r: (r['display_context'] == context, not r.get('stale'), 'OLED' in r['device'].upper()), reverse=True)
+    return {'ok': True, 'game': game, 'sources': results, 'reports': reports, 'recommendation': evidence_summary(reports, context),
             'message': 'Reports are advisory. Missing data means unknown, not a performance guarantee. Only local allowlisted adapters can apply settings.'}
 
 def parse_vdf_key(text, key):
@@ -573,11 +665,13 @@ def find_ue_configs(game):
     return result
 
 
+NATIVE_UNITY = {'892970': ('IronGate', 'Valheim'), '367520': ('Team Cherry', 'Hollow Knight')}
+
 def find_valheim_configs(game, home=None):
     """Native Unity PlayerPrefs only; never touch saves or Proton registry."""
-    if game['appid'] != '892970': return []
+    if game['appid'] not in NATIVE_UNITY: return []
     root = (Path(home) if home is not None else Path.home()) / '.config/unity3d'
-    path = root / 'IronGate/Valheim/prefs'
+    path = root.joinpath(*NATIVE_UNITY[game['appid']], 'prefs')
     if not path.is_file() or any(p.is_symlink() for p in [path, *path.parents][:-1]): return []
     try:
         transform_valheim(safe_read_text(path), 'balanced')
@@ -585,7 +679,7 @@ def find_valheim_configs(game, home=None):
     return [path]
 
 
-def transform_valheim(raw, mode):
+def transform_valheim(raw, mode, context=None):
     # Unity's native Linux XML prefs. Only existing standard resolution integers.
     # No invented Valheim quality keys, save-file edits, registry changes or commands.
     import xml.etree.ElementTree as ET
@@ -593,8 +687,9 @@ def transform_valheim(raw, mode):
         raise ValueError('Unsupported XML declarations.')
     try: root = ET.fromstring(raw)
     except ET.ParseError as exc: raise ValueError('Unsupported native preferences.') from exc
-    keys = {'Screenmanager Resolution Width': PRESETS[mode]['x'],
-            'Screenmanager Resolution Height': PRESETS[mode]['y']}
+    preset = (HANDHELD_PRESETS if profile_context(context) == 'handheld' else PRESETS)[mode]
+    keys = {'Screenmanager Resolution Width': preset['x'],
+            'Screenmanager Resolution Height': preset['y']}
     if root.tag != 'unity_prefs' or any(len(root.findall("pref[@name='"+k+"']")) != 1 for k in keys):
         raise ValueError('Native resolution preferences not found.')
     for key, value in keys.items():
@@ -609,37 +704,38 @@ def transform_valheim(raw, mode):
 
 def adapter_files(game):
     # Existing UE handling remains an explicit compatible-format adapter.
-    return [(p, 'unreal') for p in find_ue_configs(game)] + [(p, 'valheim-native') for p in find_valheim_configs(game)]
+    return [(p, 'unreal') for p in find_ue_configs(game)] + [(p, 'valheim-native' if game['appid'] == '892970' else 'hollow-knight-native') for p in find_valheim_configs(game)]
 
 
-def transform_adapter(path, raw, mode, adapter):
-    if adapter == 'unreal': return transform_ue_ini(raw, mode)
-    if adapter == 'valheim-native': return transform_valheim(raw, mode)
+def transform_adapter(path, raw, mode, adapter, context=None):
+    if adapter == 'unreal': return transform_ue_ini(raw, mode, context)
+    if adapter in ('valheim-native', 'hollow-knight-native'): return transform_valheim(raw, mode, context)
     raise ValueError('No allowlisted adapter.')
 
 
 @game_transaction
-def save_mode(mode, appid=None):
+def save_mode(mode, appid=None, context=None):
     if not isinstance(mode, str) or mode not in MODES: raise ValueError('Unknown optimisation mode.')
     if appid is not None: appid = steam_id(appid)
-    with LOCK:
-        cfg = config()
-        cfg['enabled'] = True
-        if appid:
-            cfg['games'][appid] = mode
-            cfg['approved'].pop(appid, None)
-            cfg['approved_files'].pop(appid, None)
-        else:
-            cfg['default'] = mode
-            # Preserve deliberate per-game preferences when changing the default.
-            cfg['approved'] = {k: v for k, v in cfg['approved'].items() if k in cfg['games']}
-        atomic_json(CONFIG, cfg)
-    return {'ok': True, 'mode': mode, 'message': 'Preference saved by Steam App ID. Preview and approve local changes when installed; unsupported games remain advisory.'}
+    cfg = config(); context = profile_context(context, cfg)
+    profile = cfg['profiles'][context]
+    cfg['enabled'] = True
+    if appid:
+        profile['games'][appid] = mode
+        cfg['approved'].pop(appid, None)
+        cfg['approved_files'].pop(appid, None)
+        cfg['approved_context'].pop(appid, None)
+    else:
+        profile['default'] = mode
+        cfg['approved'] = {k: v for k, v in cfg['approved'].items() if k in profile['games']}
+    write_config(cfg)
+    return {'ok': True, 'mode': mode, 'context': context, 'message': 'Preference saved. Preview before applying.'}
 
 
 @game_transaction
-def preview_profile(appid, mode):
+def preview_profile(appid, mode, context=None):
     appid = steam_id(appid)
+    context = profile_context(context)
     if not isinstance(mode, str) or mode not in MODES: raise ValueError('Unknown mode.')
     game = next((g for g in installed_games() if g['appid'] == appid), None)
     if not game: return {'ok': True, 'status': 'not-installed', 'files': [], 'message': 'Preference can be saved now. Install and launch once, then preview supported settings.'}
@@ -650,7 +746,7 @@ def preview_profile(appid, mode):
     for path, adapter in adapter_files(game):
         try:
             raw = safe_read_text(path)
-            changed = transform_adapter(path, raw, mode, adapter)
+            changed = transform_adapter(path, raw, mode, adapter, context)
             rel_id = hashlib.sha256(str(path).encode()).hexdigest()[:16]
             old = state.get(rel_id, {})
             if not isinstance(old, dict): raise ValueError('Invalid backup record.')
@@ -663,34 +759,114 @@ def preview_profile(appid, mode):
                     return {m[1]: m[2] for m in re.finditer(r'^\s*([\w.]+)\s*=\s*([^\r\n]*)', text, re.M) if m[1] in allowed}
                 before, after = values(raw), values(changed)
             else:
-                before = dict(re.findall(r'<pref[^>]+name="(Screenmanager Resolution (?:Width|Height))"[^>]*>(\d+)</pref>', raw))
-                after = dict(re.findall(r'<pref[^>]+name="(Screenmanager Resolution (?:Width|Height))"[^>]*>(\d+)</pref>', changed))
+                import xml.etree.ElementTree as ET
+                def values(text):
+                    return {n.get('name'): n.text for n in ET.fromstring(text).findall('pref')
+                            if n.get('name') in ('Screenmanager Resolution Width', 'Screenmanager Resolution Height')}
+                before, after = values(raw), values(changed)
             files.append({'file': path.name, 'adapter': adapter, 'manual_changes': manual,
                           'changes': [{'key': k, 'before': before.get(k), 'after': v} for k, v in after.items() if before.get(k) != v]})
         except (OSError, ValueError, UnicodeError):
             return {'ok': False, 'status': 'unreadable', 'files': [], 'error': 'A supported config cannot be safely read. No changes approved.'}
     if not files: return {'ok': True, 'status': 'unsupported', 'files': [], 'message': 'No compatible local adapter. Research and mode preference are advisory only.'}
-    token = sha(json.dumps([appid, mode, fingerprints], sort_keys=True))
-    return {'ok': True, 'status': 'preview', 'appid': appid, 'mode': mode, 'files': files, 'paths': [p[0] for p in fingerprints], 'token': token,
+    token = sha(json.dumps([appid, mode, context, fingerprints], sort_keys=True))
+    preset = (HANDHELD_PRESETS if context == 'handheld' else PRESETS)[mode]
+    summary = {'resolution': str(preset['x'])+' × '+str(preset['y']),
+               'quality': {1:'Low',2:'Medium',3:'High'}[preset['quality']] if any(f['adapter']=='unreal' for f in files) else None,
+               'files': len(files), 'manual_files': sum(f['manual_changes'] for f in files)}
+    return {'ok': True, 'status': 'preview', 'appid': appid, 'mode': mode, 'context': context, 'files': files, 'summary': summary, 'fingerprints': {p[0]:p[1] for p in fingerprints}, 'paths': [p[0] for p in fingerprints], 'token': token,
             'message': 'Conservative local starting points, not downloaded report instructions or measured optimal settings. Manual/game edits will be skipped. Backups precede every first edit.'}
 
 
 @game_transaction
-def approve_profile(appid, mode, token):
+def approve_profile(appid, mode, token, context=None):
     appid = steam_id(appid)
+    context = profile_context(context)
+    if context != config()['context']: return {'ok': False, 'error': 'Profile changed. Preview again.'}
     with LOCK:
-        preview = preview_profile(appid, mode)
+        preview = preview_profile(appid, mode, context)
         if preview.get('status') != 'preview' or not secrets.compare_digest(str(preview.get('token', '')), str(token)):
             return {'ok': False, 'error': 'Preview changed or game is running. Preview again before applying.'}
         game = next(g for g in installed_games() if g['appid'] == appid)
         # Never force manual changes, even after approval; preserve the user's newer edits.
-        result = apply_profile(game, mode, allowed_files=preview['paths'])
+        result = apply_profile(game, mode, allowed_files=preview['paths'], context=context, expected_hashes=preview['fingerprints'])
         if result['status'] in ('applied', 'already-set'):
-            cfg = config(); cfg['games'][appid] = mode; cfg['enabled'] = True; cfg['approved'][appid] = mode
+            cfg = config(); cfg['profiles'][context]['games'][appid] = mode; cfg['enabled'] = True; cfg['approved'][appid] = mode
+            cfg['approved_context'][appid] = context
             cfg['approved_files'][appid] = preview['paths']
-            atomic_json(CONFIG, cfg)
+            write_config(cfg)
         return {'ok': result['status'] in ('applied', 'already-set'), 'result': result,
-                'message': 'Local settings: ' + result['status'] + '. Manual/game changes are preserved.'}
+                'message': ('Updated '+str(result.get('count', 0))+' file(s). ' if result.get('count') else '') + 'Local settings: ' + result['status'] + '. Manual/game changes are preserved.'}
+
+
+@game_transaction
+def game_checkup(appid, context=None):
+    appid = steam_id(appid); cfg = config(); context = profile_context(context, cfg)
+    game = next((g for g in installed_games() if g['appid'] == appid), None)
+    mode = effective_mode(appid, cfg, context)
+    result = {'ok': True, 'appid': appid, 'context': context, 'mode': mode,
+              'status': 'not-installed', 'can_restore': False, 'backups': 0, 'optimised': False}
+    if not game: return {**result, 'message': 'Saved for when you install it.'}
+    files = adapter_files(game)
+    if not files: return {**result, 'status': 'advisory', 'message': 'Advice only. No supported settings file.'}
+    running = game_is_running(appid)
+    state = read_json(STATE, {})
+    if not isinstance(state, dict): return {**result, 'status': 'error', 'message': 'Backup records need review.'}
+    matches, manual, restorable, unreadable = True, False, 0, False
+    for path, adapter in files:
+        try:
+            raw = safe_read_text(path)
+            matches &= transform_adapter(path, raw, mode, adapter, context) == raw
+            record = state.get(hashlib.sha256(str(path).encode()).hexdigest()[:16], {})
+            if not isinstance(record, dict): raise ValueError('Invalid backup record')
+            if record:
+                unchanged = sha(raw) == record.get('after_sha')
+                manual |= not unchanged
+                backup = Path(record.get('backup', ''))
+                safe = backup.is_file() and not backup.is_symlink() and backup.resolve().is_relative_to(BACKUPS.resolve())
+                result['backups'] += int(safe)
+                unreadable |= not safe
+                restorable += int(safe and unchanged)
+        except (OSError, ValueError, UnicodeError, TypeError): unreadable = True
+    approved = (cfg['approved'].get(appid) == mode and cfg['approved_context'].get(appid) == context
+                and all(str(p) in cfg['approved_files'].get(appid, []) for p, _ in files))
+    result['can_restore'] = bool(restorable and not running)
+    result['optimised'] = bool(matches and approved and not manual and not unreadable)
+    if running: status, message = 'running', 'Close the game to make changes.'
+    elif unreadable: status, message = 'error', 'A settings file or backup needs review.'
+    elif manual: status, message = 'manual-changes', 'Your changes are protected.'
+    elif result['optimised']: status, message = 'ready', 'Your approved settings match.'
+    elif matches: status, message = 'settings-match', 'Settings match. Review to enable safe sync.'
+    else: status, message = 'needs-review', 'Ready to review settings.'
+    return {**result, 'status': status, 'message': message}
+
+
+def evidence_summary(reports, context):
+    """Specificity of community evidence, never a probability of achieved FPS."""
+    matching = [r for r in reports if r.get('display_context') == context]
+    fresh = []
+    now = dt.datetime.now(dt.timezone.utc)
+    for report in matching:
+        try:
+            date = dt.datetime.fromisoformat(report.get('report_date', '').replace('Z', '+00:00'))
+            if date.tzinfo is None: date = date.replace(tzinfo=dt.timezone.utc)
+            if 0 <= (now-date).days <= 180 and not report.get('stale'): fresh.append(report)
+        except (TypeError, ValueError, AttributeError): pass
+    independent = len({r.get('source') for r in fresh})
+    oled = [r for r in fresh if 'OLED' in r.get('device', '').upper()]
+    complete = [r for r in oled if r.get('resolution') and r.get('game_version')
+                and str(r['game_version']).lower() not in ('unknown', 'n/a', 'default')]
+    if independent >= 2 and len({r.get('source') for r in complete}) >= 2:
+        confidence, reason = 'high', 'Recent OLED reports from independent sources match this profile.'
+    elif fresh and (oled or independent >= 2):
+        confidence, reason = 'medium', 'Some recent reports match this profile; details are incomplete.'
+    elif reports:
+        confidence, reason = 'low', 'Reports are old, incomplete, offline, or from a different display setup.'
+    else: confidence, reason = 'none', 'No verified reports yet.'
+    return {'mode': 'balanced', 'confidence': confidence, 'reason': reason,
+            'context': context, 'matching_reports': len(matching),
+            'note': 'Balanced is a conservative starting point. Confidence describes matching evidence, not guaranteed performance.'}
+
 
 
 def display_diagnostics(drm_root=Path('/sys/class/drm')):
@@ -713,8 +889,8 @@ def parse_ini_sections(text):
     return re.split(r'(?=^\s*\[[^\r\n]+\]\s*$)', text, flags=re.M)
 
 
-def transform_ue_ini(raw, mode):
-    preset = PRESETS[mode]
+def transform_ue_ini(raw, mode, context=None):
+    preset = (HANDHELD_PRESETS if profile_context(context) == 'handheld' else PRESETS)[mode]
     mapping = {k: str(preset['quality']) for k in SCALABILITY_KEYS}
     mapping['sg.ResolutionQuality'] = str(preset['resolution_scale'])
     mapping.update({k: str(preset['x']) for k in GAME_KEYS if k.endswith('X') or k.endswith('Width')})
@@ -796,7 +972,7 @@ def game_is_running(appid):
         except (OSError, PermissionError):
             try:
                 if item.stat().st_uid == os.getuid(): return True
-            except FileNotFoundError: pass
+            except (OSError, PermissionError): pass
             continue
         if (b'SteamAppId=' + appid.encode() + b'\x00') in b'\x00' + blob + b'\x00':
             return True
@@ -806,7 +982,7 @@ def game_is_running(appid):
 
 
 @game_transaction
-def apply_profile(game, mode, force=False, allowed_files=None):
+def apply_profile(game, mode, force=False, allowed_files=None, context=None, expected_hashes=None):
     """Returns status. Only modifies supported existing files when no game runs."""
     files = adapter_files(game)
     if allowed_files is not None:
@@ -824,7 +1000,9 @@ def apply_profile(game, mode, force=False, allowed_files=None):
     for path, adapter in files:
         try:
             original = safe_read_text(path)
-            updated = transform_adapter(path, original, mode, adapter)
+            if expected_hashes is not None and expected_hashes.get(str(path)) != sha(original):
+                raise ValueError('Settings changed since preview; no changes made.')
+            updated = transform_adapter(path, original, mode, adapter, context)
             if updated == original:
                 continue
             rel_id = hashlib.sha256(str(path).encode()).hexdigest()[:16]
@@ -867,6 +1045,8 @@ def apply_profile(game, mode, force=False, allowed_files=None):
                     temp = Path(f.name)
                     f.write(updated.encode('utf-8')); f.flush(); os.fsync(f.fileno())
                 os.chmod(temp, path.stat().st_mode & 0o777)
+                if game_is_running(game['appid']) or sha(safe_read_text(path)) != sha(original):
+                    raise ValueError('Game started or settings changed during apply; file left alone.')
                 previous[rel_id] = {'appid': game['appid'], 'file': str(path),
                                     'backup': old.get('backup', str(backup)), 'mode': mode, 'after_sha': sha(updated)}
                 atomic_json(STATE, previous)
@@ -891,7 +1071,8 @@ def restore_game(appid):
     cfg = config()
     cfg['approved'].pop(appid, None)
     cfg['approved_files'].pop(appid, None)
-    atomic_json(CONFIG, cfg)
+    cfg['approved_context'].pop(appid, None)
+    write_config(cfg)
     state = read_json(STATE, {})
     if not isinstance(state, dict): return 'Invalid backup state. No files changed.'
     n = 0
@@ -910,7 +1091,14 @@ def restore_game(appid):
             if sha(current) != v.get('after_sha'):
                 log('RESTORE SKIP modified after DeckPilot: ' + str(path))
                 continue  # never overwrite user/game changes
-            shutil.copy2(backup, path)
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name+'.restore.', delete=False) as handle:
+                restored = Path(handle.name)
+            try:
+                shutil.copy2(backup, restored)
+                if game_is_running(appid) or sha(safe_read_text(path)) != v.get('after_sha'):
+                    continue
+                restored.replace(path)
+            finally: restored.unlink(missing_ok=True)
             del state[k]
             n += 1
         except (OSError, ValueError):
@@ -983,7 +1171,7 @@ def game_log_candidates(game, home=None):
                 continue
             stem = re.sub(r'[^a-z0-9]', '', f.stem.casefold())
             if (re.search(r'^(?:appid[-_ ]?)?' + re.escape(appid) + r'[-_ .]', f.stem, re.I)
-                    or (len(target) >= 5 and target in stem)):
+                    or (len(target) >= 5 and re.match(re.escape(target) + r'(?:20[0-9]{6}|$)', stem))):
                 try:
                     if f.stat().st_size <= 20_000_000:
                         files.append(f)
@@ -1010,6 +1198,7 @@ def _read_mangohud_csv(path_name, mtime_ns, size):
     """
     vals = []
     elapsed = []
+    frame_times = []
     try:
         if path.stat().st_size > 20_000_000:
             return None
@@ -1017,11 +1206,13 @@ def _read_mangohud_csv(path_name, mtime_ns, size):
             rd = csv.reader(f)
             idx = None
             idx_elapsed = None
+            idx_frame_time = None
             for row in rd:
                 names = [v.strip().casefold() for v in row]
                 if idx is None:
                     if 'fps' in names and ('frametime' in names or 'elapsed' in names):
                         idx = names.index('fps')
+                        idx_frame_time = names.index('frametime') if 'frametime' in names else None
                         idx_elapsed = names.index('elapsed') if 'elapsed' in names else None
                     continue
                 if len(row) <= idx:
@@ -1030,6 +1221,11 @@ def _read_mangohud_csv(path_name, mtime_ns, size):
                     number = float(row[idx])
                     if 1 <= number <= 300:
                         vals.append(number)
+                        if idx_frame_time is not None and len(row) > idx_frame_time:
+                            try:
+                                frametime = float(row[idx_frame_time])
+                                if 0 < frametime <= 1000: frame_times.append(frametime)
+                            except ValueError: pass
                         if idx_elapsed is not None and len(row) > idx_elapsed:
                             elapsed.append(float(row[idx_elapsed]))
                 except (ValueError, IndexError):
@@ -1049,7 +1245,10 @@ def _read_mangohud_csv(path_name, mtime_ns, size):
         duration = round(diff / (1e9 if diff > 1e8 else 1), 1)
     return {'avg_fps': round(statistics.mean(vals), 1),
             'low_1pct_fps': round(statistics.mean(ordered[:slow]), 1),
-            'samples': len(vals), 'duration_s': duration}
+            'samples': len(vals), 'duration_s': duration,
+            'frame_time_avg_ms': round(statistics.mean(frame_times), 2) if len(frame_times) >= 60 else None,
+            'frame_time_p95_ms': round(sorted(frame_times)[max(0, (95*len(frame_times)+99)//100-1)], 2) if len(frame_times) >= 60 else None,
+            'measurement_note': 'Existing user-recorded MangoHud data. Device/profile/session is unverified; no automatic tuning.'}
 
 
 def game_metrics(game):
@@ -1114,7 +1313,7 @@ def diagnostic_report():
         'external_vrr_advertised': external_vrr_capability(),
         'display': display_diagnostics(),
         'unsupported_games': len(games) - file_count,
-        'adapter_counts': {name: sum(any(a == name for _, a in adapter_files(g)) for g in games) for name in ('unreal', 'valheim-native')},
+        'adapter_counts': {name: sum(any(a == name for _, a in adapter_files(g)) for g in games) for name in ('unreal', 'valheim-native', 'hollow-knight-native')},
         'log_lines': lines, 'errors': [l for l in lines if re.search(r'(?i)\b(error|exception|traceback|failed)\b', l)][-40:],
         'notes': ['Google Drive upload is optional and requires enabling it in DeckPilot.', 'Log redaction is best-effort; review before sharing.',
                   'VRR capability is not proof VRR is active.', 'No raw game configuration files are included.']
@@ -1200,19 +1399,42 @@ def cloud_status():
             'last_status': cfg['last_status'][:180]}
 
 
+def cloud_state_update(**changes):
+    # Short metadata lock only: slow Drive operations must not block game settings.
+    with LOCK:
+        mkdir()
+        with (BASE/'cloud-state.lock').open('a') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                cfg = cloud_config(); cfg.update(changes); atomic_json(CLOUD, cfg)
+                return cfg
+            finally: fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def serialized_cloud_upload(fn):
+    @wraps(fn)
+    def guarded(*args, **kwargs):
+        mkdir()
+        with (BASE/'cloud-upload.lock').open('a') as handle:
+            try: fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError: return 'A diagnostic upload is already in progress.'
+            try: return fn(*args, **kwargs)
+            finally: fcntl.flock(handle, fcntl.LOCK_UN)
+    return guarded
+
+
 def cloud_enable(enabled):
     enabled = enabled is True
     if enabled:
         ready, reason = drive_ready()
         if not ready:
             raise ValueError(reason)
-    cfg = cloud_config()
-    cfg['enabled'] = enabled
-    cfg['last_status'] = 'Cloud uploads enabled' if enabled else 'Cloud uploads disabled'
-    atomic_json(CLOUD, cfg)
-    return cfg['last_status']
+    message = 'Cloud uploads enabled' if enabled else 'Cloud uploads disabled'
+    cloud_state_update(enabled=enabled, last_status=message)
+    return message
 
 
+@serialized_cloud_upload
 def upload_cloud_report(force=False, report=None):
     """Only writes a ZIP to ONE fixed, private Drive path. Never deletes remote files.
 
@@ -1220,57 +1442,56 @@ def upload_cloud_report(force=False, report=None):
     otherwise at most daily, and only when enabled. Manual uploads bypass the
     throttle but still require the prior opt-in switch.
     """
-    with LOCK:
-        cfg = cloud_config()
-        if not cfg['enabled']:
-            return 'Google Drive uploads are disabled.'
-        ready, reason = drive_ready()
-        if not ready:
-            cfg['last_status'] = reason
-            atomic_json(CLOUD, cfg)
-            return reason
-        report = report if report is not None else diagnostic_report()
-        fingerprint = cloud_fingerprint(report)
-        error_fingerprint = sha(json.dumps(report.get('errors', []), sort_keys=True))
-        now = time.time()
-        changed = fingerprint != cfg['last_fingerprint']
-        errors_changed = bool(report.get('errors')) and error_fingerprint != cfg['last_error_fingerprint']
-        elapsed = now - cfg['last_success']
-        if not force and elapsed < (1800 if errors_changed else 86400):
-            return 'Drive report is up to date; next check later.'
-        if not force and not changed and elapsed < 86400:
-            return 'No new changes to upload.'
-        binary = rclone_binary()
-        REPORTS.mkdir(parents=True, exist_ok=True)
-        path = None
-        try:
-            with tempfile.NamedTemporaryFile(prefix='deckpilot-cloud-', suffix='.zip', dir=REPORTS,
-                                              delete=False) as f:
-                path = Path(f.name)
-                os.chmod(path, 0o600)
-                f.write(make_diagnostic_zip(report))
-            dest = CLOUD_REMOTE + CLOUD_FOLDER + '/' + CLOUD_FILENAME
-            result = subprocess.run([binary, 'copyto', str(path), dest, '--retries', '1',
-                                     '--contimeout', '15s', '--timeout', '45s'],
-                                    capture_output=True, text=True, timeout=90, check=False)
-            if result.returncode != 0:
-                cfg['last_status'] = 'Google Drive upload failed (check your connection and rclone setup).'
-                atomic_json(CLOUD, cfg)
-                log('CLOUD upload failed')  # no rclone stderr or OAuth tokens in app log
-                return cfg['last_status']
-            cfg.update(last_success=now, last_fingerprint=fingerprint,
-                       last_error_fingerprint=error_fingerprint,
-                       last_status='Uploaded latest diagnostic ZIP to your private Drive folder.')
-            atomic_json(CLOUD, cfg)
+    cfg = cloud_config()
+    if not cfg['enabled']:
+        return 'Google Drive uploads are disabled.'
+    ready, reason = drive_ready()
+    if not ready:
+        cfg['last_status'] = reason
+        cloud_state_update(last_status=cfg['last_status'])
+        return reason
+    report = report if report is not None else diagnostic_report()
+    fingerprint = cloud_fingerprint(report)
+    error_fingerprint = sha(json.dumps(report.get('errors', []), sort_keys=True))
+    now = time.time()
+    changed = fingerprint != cfg['last_fingerprint']
+    errors_changed = bool(report.get('errors')) and error_fingerprint != cfg['last_error_fingerprint']
+    elapsed = now - cfg['last_success']
+    if not force and elapsed < (1800 if errors_changed else 86400):
+        return 'Drive report is up to date; next check later.'
+    if not force and not changed and elapsed < 86400:
+        return 'No new changes to upload.'
+    binary = rclone_binary()
+    REPORTS.mkdir(parents=True, exist_ok=True)
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='deckpilot-cloud-', suffix='.zip', dir=REPORTS,
+                                          delete=False) as f:
+            path = Path(f.name)
+            os.chmod(path, 0o600)
+            f.write(make_diagnostic_zip(report))
+        if not cloud_config()['enabled']: return 'Google Drive uploads are disabled.'
+        dest = CLOUD_REMOTE + CLOUD_FOLDER + '/' + CLOUD_FILENAME
+        result = subprocess.run([binary, 'copyto', str(path), dest, '--retries', '1',
+                                 '--contimeout', '15s', '--timeout', '45s'],
+                                capture_output=True, text=True, timeout=90, check=False)
+        if result.returncode != 0:
+            cfg['last_status'] = 'Google Drive upload failed (check your connection and rclone setup).'
+            cloud_state_update(last_status=cfg['last_status'])
+            log('CLOUD upload failed')  # no rclone stderr or OAuth tokens in app log
             return cfg['last_status']
-        except (OSError, subprocess.TimeoutExpired):
-            cfg['last_status'] = 'Google Drive upload failed or timed out.'
-            atomic_json(CLOUD, cfg)
-            log('CLOUD upload error')
-            return cfg['last_status']
-        finally:
-            if path is not None:
-                path.unlink(missing_ok=True)
+        cfg = cloud_state_update(last_success=now, last_fingerprint=fingerprint,
+                   last_error_fingerprint=error_fingerprint,
+                   last_status='Uploaded latest diagnostic ZIP to your private Drive folder.')
+        return cfg['last_status']
+    except (OSError, subprocess.TimeoutExpired):
+        cfg['last_status'] = 'Google Drive upload failed or timed out.'
+        cloud_state_update(last_status=cfg['last_status'])
+        log('CLOUD upload error')
+        return cfg['last_status']
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
 
 
 def mode_hint(mode, metrics):
@@ -1327,7 +1548,9 @@ def start_local_update(action='install'):
     if not runner: raise ValueError('The SteamOS update helper is unavailable.')
     cmd=[runner,'--user','--collect','--unit=deckpilot-update-'+str(int(time.time())),
          '/usr/bin/python3',str(BASE/'app'/'updater.py'),action]
-    if action=='install':cmd.append(str(candidate['path']))
+    if action=='install':
+        cmd.append(str(candidate['path']))
+        if candidate.get('sha256'):cmd += ['--sha256', candidate['sha256']]
     result=subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=12,check=False)
     if result.returncode:raise ValueError('Could not start update. Current app is unchanged.')
     return 'Update started. DeckPilot will restart; your settings are preserved.'
@@ -1349,12 +1572,15 @@ def state_for_ui():
         adapters = adapter_files(g)
         has_adapter = bool(adapters)
         mode = effective_mode(g['appid'], cfg)
-        metrics = game_metrics(g)
+        metrics = game_metrics(g) if cfg['measurements_enabled'] else None
         result.append({'appid': g['appid'], 'name': g['name'], 'mode': mode,
                        'adapter': ', '.join(sorted({a for _, a in adapters})) if has_adapter else 'Advisory only',
-                       'approved': cfg['approved'].get(g['appid']) == mode,
+                       'approved': cfg['approved'].get(g['appid']) == mode and cfg['approved_context'].get(g['appid']) == cfg['context'],
                        'supported': has_adapter, 'metrics': metrics, 'hint': mode_hint(mode, metrics)})
-    return {'version': VERSION, 'enabled': cfg['enabled'], 'default': cfg['default'], 'games': result, 'count': len(result),
+    return {'version': VERSION, 'schema_version': 2, 'context': cfg['context'], 'profiles': cfg['profiles'],
+            'measurements_enabled': cfg['measurements_enabled'],
+            'launch_prompt': {'enabled': False, 'available': False, 'reason': 'No safe launch gate has been hardware-validated. Steam Play is untouched.'},
+            'enabled': cfg['enabled'], 'default': cfg['default'], 'games': result, 'count': len(result),
             'supported': sum(1 for g in result if g['supported']),
             'vrr_capability': external_vrr_capability(), 'display': display_diagnostics(), 'saved_games': cfg['games'], 'cloud': cloud_status()}
 
@@ -1426,8 +1652,8 @@ def synchronize():
     for g in installed_games():
         mode = effective_mode(g['appid'], cfg)
         approved_paths = cfg['approved_files'].get(g['appid'], [])
-        if cfg['approved'].get(g['appid']) == mode and approved_paths:
-            apply_profile(g, mode, allowed_files=approved_paths)
+        if cfg['approved'].get(g['appid']) == mode and cfg['approved_context'].get(g['appid']) == cfg['context'] and approved_paths:
+            apply_profile(g, mode, allowed_files=approved_paths, context=cfg['context'])
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1469,11 +1695,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/api/search':
                 self.send_json(search_steam(payload.get('query', ''))); return
             if self.path == '/api/research':
-                self.send_json(research_game(steam_id(payload['appid']))); return
+                self.send_json(research_game(steam_id(payload['appid']), payload.get('context'))); return
             if self.path == '/api/preview':
-                self.send_json(preview_profile(payload['appid'], payload['mode'])); return
+                self.send_json(preview_profile(payload['appid'], payload['mode'], payload.get('context'))); return
             if self.path == '/api/apply':
-                self.send_json(approve_profile(payload['appid'], payload['mode'], payload['token'])); return
+                self.send_json(approve_profile(payload['appid'], payload['mode'], payload['token'], payload.get('context'))); return
             if self.path == '/api/diagnostics':
                 with LOCK:
                     data = make_diagnostic_zip()
@@ -1507,7 +1733,7 @@ class Handler(BaseHTTPRequestHandler):
                     results = [restore_game(g['appid']) for g in installed_games()]
                 self.send_json({'ok': True, 'message': 'Restoration checked for ' + str(len(results)) + ' games. Original files were restored only where it was safe. Check the DeckPilot log for skipped files.'})
                 return
-            self.send_json(save_mode(payload['mode'], payload.get('appid')))
+            self.send_json(save_mode(payload['mode'], payload.get('appid'), payload.get('context')))
         except (ValueError, KeyError, json.JSONDecodeError) as ex:
             self.send_json({'error': str(ex)}, 400)
 
@@ -1559,17 +1785,26 @@ def run_server():
 
 def main():
     parser = argparse.ArgumentParser(description='DeckPilot TV: Steam Deck OLED docked game optimiser')
-    parser.add_argument('command', choices=['serve', 'scan', 'apply', 'restore', 'status', 'diagnose', 'export', 'cloud-status', 'cloud-upload', 'cloud-enable', 'cloud-disable', 'update-status', 'set-mode', 'plugin-state', 'check-github', 'install-update', 'rollback-update', 'search', 'research', 'preview', 'approve'])
+    parser.add_argument('command', choices=['serve', 'scan', 'apply', 'restore', 'status', 'diagnose', 'export', 'cloud-status', 'cloud-upload', 'cloud-enable', 'cloud-disable', 'update-status', 'set-mode', 'plugin-state', 'check-github', 'install-update', 'rollback-update', 'search', 'research', 'preview', 'approve', 'set-context', 'checkup', 'measurements-enable', 'measurements-disable'])
     parser.add_argument('appid', nargs='?')
     parser.add_argument('--mode', choices=sorted(MODES))
     parser.add_argument('--preview-token', default='')
+    parser.add_argument('--context', choices=sorted(CONTEXTS))
     args = parser.parse_args()
+    if args.command in ('set-context', 'checkup', 'measurements-enable', 'measurements-disable'):
+        try:
+            if args.command == 'set-context': result = set_context(args.context)
+            elif args.command == 'checkup': result = game_checkup(args.appid, args.context)
+            else: result = set_measurements(args.command == 'measurements-enable')
+            print(json.dumps(result))
+        except ValueError as exc: print(json.dumps({'ok': False, 'error': str(exc)}))
+        return
     if args.command in ('search', 'research', 'preview', 'approve'):
         try:
             if args.command == 'search': result = search_steam(args.appid or '')
-            elif args.command == 'research': result = research_game(steam_id(args.appid))
-            elif args.command == 'preview': result = preview_profile(args.appid, args.mode)
-            else: result = approve_profile(args.appid, args.mode, args.preview_token)
+            elif args.command == 'research': result = research_game(steam_id(args.appid), args.context)
+            elif args.command == 'preview': result = preview_profile(args.appid, args.mode, args.context)
+            else: result = approve_profile(args.appid, args.mode, args.preview_token, args.context)
             print(json.dumps(result, ensure_ascii=False))
         except ValueError as exc: print(json.dumps({'ok': False, 'error': str(exc)}))
         return
@@ -1587,7 +1822,7 @@ def main():
         print(json.dumps(updater.fetch_github_update(installed_version=VERSION)));return
     if args.command == 'set-mode':
         if not args.mode: parser.error('--mode is required')
-        try: print(json.dumps(save_mode(args.mode, args.appid)))
+        try: print(json.dumps(save_mode(args.mode, args.appid, args.context)))
         except ValueError as exc: parser.error(str(exc))
         return
     if args.command == 'export':

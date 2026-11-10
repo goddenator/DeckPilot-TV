@@ -23,6 +23,10 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import zipfile
+import fcntl
+from contextlib import contextmanager
+from functools import wraps
+import inspect
 
 APPDIR = Path.home() / '.local/share/deckpilot-tv/app'
 DATA = Path.home() / '.local/share/deckpilot-tv'
@@ -44,6 +48,40 @@ APP_FILES = ('deckpilot.py', 'updater.py', 'VERSION.txt')
 
 class UpdateError(Exception):
     pass
+
+
+def atomic_record(path, value):
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name+'.', delete=False) as handle:
+        temp = Path(handle.name)
+        try:
+            handle.write((json.dumps(value, indent=2)+'\n').encode('utf-8'))
+            handle.flush(); os.fsync(handle.fileno()); temp.replace(path)
+        finally: temp.unlink(missing_ok=True)
+
+
+@contextmanager
+def update_lock(directory):
+    directory = Path(directory); directory.mkdir(parents=True, exist_ok=True)
+    with (directory/'.operation.lock').open('a') as handle:
+        try: fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc: raise UpdateError('Another update operation is running. Try again shortly.') from exc
+        try: yield
+        finally: fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def serialized_update(fn):
+    @wraps(fn)
+    def guarded(*args, **kwargs):
+        bound = inspect.signature(fn).bind_partial(*args, **kwargs)
+        directory = Path(bound.arguments.get('ready', READY)).parent if fn.__name__ == 'fetch_github_update' else bound.arguments.get('updates', UPDATES)
+        try:
+            with update_lock(directory): return fn(*args, **kwargs)
+        except UpdateError as exc:
+            if fn.__name__ == 'fetch_github_update':
+                return {'status': 'error', 'message': str(exc)}
+            raise
+    return guarded
 
 
 def version_tuple(raw):
@@ -157,19 +195,19 @@ def configure_source(repository, source=SOURCE):
         raise UpdateError('Use a GitHub repository in owner/name format.')
     source = Path(source)
     source.parent.mkdir(parents=True, exist_ok=True)
-    target = source.with_suffix('.tmp')
-    target.write_text(json.dumps({'enabled': bool(repository), 'repository': repository}, indent=2)+'\n', encoding='utf-8')
-    target.replace(source)
+    atomic_record(source, {'enabled': bool(repository), 'repository': repository})
     return repository
 
 
 def safe_redirect_url(url):
     """Only GitHub release assets and GitHub-hosted asset redirects are allowed."""
-    v = urllib.parse.urlsplit(url)
-    return v.scheme == 'https' and v.hostname in {
-        'api.github.com', 'github.com', 'objects.githubusercontent.com',
-        'release-assets.githubusercontent.com',
-    } and v.username is None and v.password is None and v.port in (None,443)
+    try:
+        v = urllib.parse.urlsplit(url)
+        return v.scheme == 'https' and v.hostname in {
+            'api.github.com', 'github.com', 'objects.githubusercontent.com',
+            'release-assets.githubusercontent.com',
+        } and v.username is None and v.password is None and v.port in (None,443)
+    except (ValueError, TypeError): return False
 
 
 class GitHubRedirects(urllib.request.HTTPRedirectHandler):
@@ -207,9 +245,7 @@ def remote_release_metadata(payload, installed_version, repository):
 def record_remote(status, message, **other):
     REMOTE_STATE.parent.mkdir(parents=True, exist_ok=True)
     d = {'status':status, 'message':message[:240], 'checked_at':time.time(), **other}
-    tmp=REMOTE_STATE.with_suffix('.tmp')
-    tmp.write_text(json.dumps(d,indent=2)+'\n', encoding='utf-8')
-    tmp.replace(REMOTE_STATE)
+    atomic_record(REMOTE_STATE, d)
     return d
 
 
@@ -235,6 +271,7 @@ def _limited_get(url, limit, timeout=12):
         return raw
 
 
+@serialized_update
 def fetch_github_update(repository=None, installed_version=None, ready=READY):
     """Fetch signed-by-GitHub digest asset from explicitly configured public repo.
 
@@ -260,7 +297,7 @@ def fetch_github_update(repository=None, installed_version=None, ready=READY):
                 else:
                     inspect_zip(target, installed_version)
                     return record_remote('ready','Verified release downloaded. Press Install Update.',
-                                         repository=repository,version=data['version'],path=str(target))
+                                         repository=repository,version=data['version'],path=str(target),sha256=data['sha256'])
             except (OSError,UpdateError):
                 target.unlink(missing_ok=True)
         raw=_limited_get(data['url'],MAX_ZIP_BYTES,timeout=25)
@@ -278,7 +315,7 @@ def fetch_github_update(repository=None, installed_version=None, ready=READY):
         for obsolete in ready.glob('DeckPilot_TV_v*.zip'):
             if obsolete!=target: obsolete.unlink(missing_ok=True)
         return record_remote('ready','Verified release downloaded. Press Install Update.',
-                             repository=repository,version=data['version'],path=str(target))
+                             repository=repository,version=data['version'],path=str(target),sha256=data['sha256'])
     except urllib.error.HTTPError as exc:
         messages = {
             404: 'No public release found. The repository may be private, missing, or have no published release yet.',
@@ -304,7 +341,13 @@ def candidate_for_install(installed_version=None):
         try:
             path=Path(remote['path'])
             if path.parent.resolve()==READY.resolve():
+                digest = remote.get('sha256')
+                if not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest):
+                    raise UpdateError('Refresh the release feed to verify this staged download.')
+                if path.stat().st_size > MAX_ZIP_BYTES or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                    raise UpdateError('Staged download changed. Check for updates again.')
                 online=inspect_zip(path,installed_version)
+                online['sha256']=digest
         except (ValueError,UpdateError,OSError):
             pass
     if not online:return local
@@ -317,9 +360,7 @@ def record(status, message, version=None, updates=UPDATES):
     result = {'status': status, 'message': message, 'version': version,
               'timestamp_utc': dt.datetime.now(dt.timezone.utc).isoformat()}
     dest = updates / 'result.json'
-    tmp = updates / 'result.json.tmp'
-    tmp.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
-    tmp.replace(dest)
+    atomic_record(dest, result)
 
 
 def service_call(action):
@@ -343,7 +384,21 @@ def healthy(version, timeout=18):
     return False
 
 
-def install_archive(path, appdir=APPDIR, updates=UPDATES, manage_service=True):
+@serialized_update
+def install_archive(path, appdir=APPDIR, updates=UPDATES, manage_service=True, expected_sha256=None):
+    """Freeze the approved archive before validation/installation to prevent replacement races."""
+    path = Path(path); updates = Path(updates); updates.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='deckpilot-approved-', dir=updates) as temp:
+        with path.open('rb') as handle: raw = handle.read(MAX_ZIP_BYTES+1)
+        if len(raw) > MAX_ZIP_BYTES: raise UpdateError('Update ZIP exceeds the size limit.')
+        if expected_sha256 is not None:
+            if not re.fullmatch(r'[a-f0-9]{64}', expected_sha256) or hashlib.sha256(raw).hexdigest() != expected_sha256:
+                raise UpdateError('Approved GitHub digest does not match this ZIP. Download again.')
+        snapshot = Path(temp)/path.name; snapshot.write_bytes(raw)
+        return _install_snapshot(snapshot, appdir, updates, manage_service)
+
+
+def _install_snapshot(path, appdir=APPDIR, updates=UPDATES, manage_service=True):
     appdir = Path(appdir)
     updates = Path(updates)
     info = inspect_zip(path, current_version(appdir))
@@ -380,13 +435,18 @@ def install_archive(path, appdir=APPDIR, updates=UPDATES, manage_service=True):
             last = updates / 'previous-app'
             # Keep only one prior app snapshot. Preferences and saved game config
             # backups are elsewhere and never touched by this updater.
-            if last.exists(): shutil.rmtree(last)
-            backup.rename(last)
+            prior = stage/'prior-snapshot'
+            if last.exists(): last.rename(prior)
+            try: backup.rename(last)
+            except Exception:
+                if prior.exists(): prior.rename(last)
+                raise
             record('success', 'Installed v' + info['version'] + '. Previous version saved for rollback.', info['version'], updates)
             return info['version']
         except Exception as exc:
+            recovery = backup if backup.exists() else updates/'previous-app'
             for name in APP_FILES:
-                old = backup / name
+                old = recovery / name
                 if old.is_file():
                     shutil.copy2(old, appdir/name)
                 else:
@@ -398,6 +458,7 @@ def install_archive(path, appdir=APPDIR, updates=UPDATES, manage_service=True):
             raise UpdateError('Update failed and was rolled back.') from exc
 
 
+@serialized_update
 def rollback_previous(appdir=APPDIR, updates=UPDATES, manage_service=True):
     """Restore the single prior version after a regression (manual action)."""
     appdir, updates = Path(appdir), Path(updates)
@@ -446,6 +507,7 @@ def main():
     parser = argparse.ArgumentParser(description='Install a trusted DeckPilot ZIP and roll back on failure.')
     parser.add_argument('command', choices=['check', 'install', 'rollback'])
     parser.add_argument('archive', nargs='?')
+    parser.add_argument('--sha256')
     args = parser.parse_args()
     try:
         if args.command == 'check':
@@ -456,7 +518,7 @@ def main():
             print('Restored:', rollback_previous()); return
         if not args.archive:
             raise UpdateError('No update ZIP was provided.')
-        print('Installed:', install_archive(args.archive))
+        print('Installed:', install_archive(args.archive, expected_sha256=args.sha256))
     except UpdateError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)

@@ -282,12 +282,12 @@ class BridgeTests(unittest.TestCase):
             self.assertFalse(asyncio.run(b.Plugin().get_state())['ok']);launch.assert_not_called()
 
 
-class UpdateErrors(unittest.TestCase):
+class UpdateErrors(IsolatedData):
     def test_specific_http_and_network_errors_without_response_secrets(self):
         for code,expected in [(404,'No public release'),(403,'denied'),(429,'rate limit')]:
             error=urllib.error.HTTPError('https://api.github.com/',code,'SECRET',{},None)
             with patch.object(updater,'_limited_get',side_effect=error),patch.object(updater,'record_remote',side_effect=lambda st,msg,**kw:{'status':st,'message':msg}):
-                result=updater.fetch_github_update('goddenator/DeckPilot-TV','0.8.0')
+                result=updater.fetch_github_update('goddenator/DeckPilot-TV','0.8.0',ready=self.root/'updates/ready')
             self.assertIn(expected,result['message']);self.assertNotIn('SECRET',str(result))
 
 class PublicSchemaContracts(IsolatedData):

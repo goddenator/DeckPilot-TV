@@ -35,7 +35,7 @@ class Plugin:
             proc = await asyncio.create_subprocess_exec(
                 '/usr/bin/python3', str(app), *args, cwd=str(home),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env, **identity)
-            try: stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
+            try: stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120 if args and args[0]=='cloud-upload' else 45)
             except asyncio.TimeoutError:
                 proc.kill(); await proc.communicate()
                 return {'ok': False, 'error': 'DeckPilot took too long to respond.'}
@@ -47,18 +47,30 @@ class Plugin:
             return {'ok': False, 'error': 'Cannot run DeckPilot as deck. Verify the app installation and Decky user configuration.'}
 
     async def get_state(self): return await self._run('plugin-state')
-    async def set_mode(self, mode: str, appid: str = ''):
+    async def set_mode(self, mode: str, appid: str = '', context: str = ''):
         if mode not in ('graphics', 'performance', 'balanced'): return {'ok': False, 'error': 'Unknown mode'}
         if appid and (not appid.isascii() or not appid.isdigit()): return {'ok': False, 'error': 'Invalid game id'}
-        return await self._run('set-mode', *([appid] if appid else []), '--mode', mode)
+        return await self._run('set-mode', *([appid] if appid else []), '--mode', mode, *(['--context', context] if context else []))
     async def search_games(self, query: str): return await self._run('search', str(query)[:120])
-    async def research_game(self, appid: str): return await self._run('research', str(appid))
-    async def preview(self, appid: str, mode: str): return await self._run('preview', str(appid), '--mode', str(mode))
-    async def approve(self, appid: str, mode: str, token: str):
-        return await self._run('approve', str(appid), '--mode', str(mode), '--preview-token', str(token))
+    async def research_game(self, appid: str, context: str = ''):
+        return await self._run('research', str(appid), *(['--context', context] if context else []))
+    async def preview(self, appid: str, mode: str, context: str = ''):
+        return await self._run('preview', str(appid), '--mode', str(mode), *(['--context', context] if context else []))
+    async def approve(self, appid: str, mode: str, token: str, context: str = ''):
+        return await self._run('approve', str(appid), '--mode', str(mode), '--preview-token', str(token), *(['--context', context] if context else []))
     async def restore(self, appid: str):
         if not isinstance(appid, str) or not appid.isascii() or not appid.isdigit(): return {'ok': False, 'error': 'Invalid game id'}
         return await self._run('restore', appid)
+    async def set_context(self, context: str): return await self._run('set-context', '--context', context)
+    async def get_checkup(self, appid: str, context: str):
+        return await self._run('checkup', str(appid), '--context', context)
+    async def set_measurements(self, enabled: bool):
+        if not isinstance(enabled, bool): return {'ok': False, 'error': 'Expected on/off'}
+        return await self._run('measurements-enable' if enabled else 'measurements-disable')
+    async def diagnostics(self): return await self._run('export')
+    async def cloud_action(self, action: str):
+        if action not in ('enable', 'disable', 'upload'): return {'ok': False, 'error': 'Unknown diagnostics action'}
+        return await self._run('cloud-'+action)
     async def check_github(self): return await self._run('check-github')
     async def install_update(self): return await self._run('install-update')
     async def rollback_update(self): return await self._run('rollback-update')

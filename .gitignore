@@ -3,3 +3,5 @@ __pycache__/
 decky/node_modules/
 decky/dist/
 out/
+decky/test-results/
+decky/playwright-report/
