@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Optional browser integration smoke test. Requires Python Playwright and Chromium.
+
+Uses an ephemeral port and private temporary data, never an installed service.
+"""
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+import threading
+from unittest.mock import patch
+
+from playwright.sync_api import sync_playwright
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'app'))
+import deckpilot as d
+
+
+class TestHandler(d.Handler):
+    token = 'isolated-browser-test'
+    def valid_host(self):
+        return self.headers.get('Host') == '127.0.0.1:'+str(self.server.server_port)
+
+    def do_POST(self):
+        # Production intentionally accepts only its fixed loopback origin. Adapt
+        # this test's ephemeral origin, without loosening production validation.
+        if self.headers.get('Origin') == 'http://127.0.0.1:'+str(self.server.server_port):
+            self.headers.replace_header('Origin', 'http://127.0.0.1:38647')
+        super().do_POST()
+
+
+def smoke():
+    with tempfile.TemporaryDirectory() as temp:
+        data=Path(temp)
+        with patch.multiple(d, BASE=data,CONFIG=data/'config.json',STATE=data/'state.json',
+                            BACKUPS=data/'backups',LOG=data/'app.log',CLOUD=data/'cloud.json'), \
+             patch.object(d,'installed_games',return_value=[]):
+            server=d.ThreadingHTTPServer(('127.0.0.1',0),TestHandler)
+            threading.Thread(target=server.serve_forever,daemon=True).start()
+            try:
+                with sync_playwright() as pw:
+                    browser=pw.chromium.launch(executable_path=os.environ.get('CHROMIUM_PATH') or shutil.which('chromium'),headless=True,args=['--no-sandbox'])
+                    try:
+                        page=browser.new_page();errors=[]
+                        page.on('pageerror',lambda e:errors.append(str(e)))
+                        page.goto('http://127.0.0.1:'+str(server.server_port))
+                        page.get_by_role('heading',name='Default optimisation').wait_for()
+                        page.get_by_role('button',name='Balanced',exact=True).click()
+                        page.wait_for_function("document.getElementById('feedback').textContent.includes('Preference saved')")
+                        page.route('**/api/search',lambda r:r.fulfill(json={'ok':True,'games':[{'appid':'892970','name':'Valheim'}]}))
+                        page.get_by_role('textbox',name='Steam game name or App ID').fill('Valheim')
+                        page.get_by_role('button',name='Search Steam',exact=True).click()
+                        page.locator('#steam-results').get_by_text('Valheim · 892970').wait_for()
+                        page.locator('#steam-results').get_by_role('button',name='Best Graphics',exact=True).click()
+                        page.wait_for_function("document.getElementById('feedback').textContent.includes('Preference can be saved')")
+                        assert json.loads((data/'config.json').read_text())['games']['892970']=='graphics'
+                        page.route('**/api/research',lambda r:r.fulfill(json={'ok':True,'sources':[{'source':'ShareDeck','status':'unavailable'}],'reports':[{'source':'Test source','url':'https://sharedeck.games/apps/892970','device':'unknown','display_context':'handheld','summary':'<img src=x onerror=alert(1)> $(touch /tmp/never)','uncertainty':'Handheld-only; TV unknown'}]}))
+                        page.get_by_role('button',name='Research',exact=True).click()
+                        page.locator('#research-results').get_by_text('ShareDeck: unavailable').wait_for()
+                        assert page.locator('#research-results img').count()==0
+                        assert not errors,errors
+                    finally:browser.close()
+            finally:
+                server.shutdown();server.server_close()
+    print('Browser smoke passed: isolated dashboard, preferences, search, source failures, escaped hostile text; no JavaScript errors.')
+
+
+if __name__=='__main__':smoke()

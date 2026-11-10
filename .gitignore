@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+decky/node_modules/
+decky/dist/
+out/

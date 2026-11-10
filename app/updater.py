@@ -279,9 +279,19 @@ def fetch_github_update(repository=None, installed_version=None, ready=READY):
             if obsolete!=target: obsolete.unlink(missing_ok=True)
         return record_remote('ready','Verified release downloaded. Press Install Update.',
                              repository=repository,version=data['version'],path=str(target))
-    except (OSError,ValueError,urllib.error.URLError,UpdateError,TimeoutError,json.JSONDecodeError) as exc:
-        # No accidental information disclosure from upstream exception bodies.
-        return record_remote('error','Unable to fetch or verify the GitHub release. Check repository and connectivity.',repository=repository)
+    except urllib.error.HTTPError as exc:
+        messages = {
+            404: 'No public release found. The repository may be private, missing, or have no published release yet.',
+            401: 'GitHub denied authentication. Verify the public release repository.',
+            403: 'GitHub access denied or rate limited. Check network policy and retry later.',
+            429: 'GitHub rate limit reached. Retry later.',
+        }
+        return record_remote('error', messages.get(exc.code, 'GitHub returned HTTP '+str(exc.code)+'. Retry later.'), repository=repository)
+    except UpdateError as exc:
+        # These are locally generated validation messages, never remote response bodies.
+        return record_remote('error', str(exc), repository=repository)
+    except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
+        return record_remote('error', 'Cannot reach the GitHub release feed or read its response. Check connectivity, TLS trust and network access to api.github.com; current installation is unchanged.', repository=repository)
 
 
 def candidate_for_install(installed_version=None):

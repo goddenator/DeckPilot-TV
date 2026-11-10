@@ -1,77 +1,36 @@
-# DeckPilot TV v0.6 — Steam Deck OLED, docked 4K/VRR TV
+# DeckPilot TV v0.8.0
 
-**Experimental prototype — not yet hardware-tested on a Steam Deck.** Designed for the official Valve dock and a 4K 120 Hz VRR television. The official dock supports up to 4K at 60 Hz or 1440p at 120 Hz; actual available VRR depends on SteamOS, dock firmware, cabling and the TV. DeckPilot reads advertised VRR capability but cannot enable VRR itself.
+Experimental Steam Deck OLED/docked-TV research and cautious settings tool. No paid API or subscription. Community evidence does not guarantee TV performance; the official Valve dock supports up to 4K60 or 1440p120 depending on connection, not guaranteed 4K120.
 
-This release makes **future updates easy** and enables **optional, uncluttered Google Drive diagnostics** without a paid OpenAI API.
+## Routine use
 
-## One-time installation
+Use the Decky panel in Gaming Mode to search Steam by title or App ID, including uninstalled games. Check the exact name/App ID before selecting. Research queries Deck Settings / deckverified.games, ShareDeck and SteamDeckHQ independently, with links/dates and unknown fields labelled. OLED/docked reports rank first when available. Handheld-only reports are labelled; reported averages and FPS caps/targets are distinct.
 
-1. Switch your Steam Deck into **Desktop Mode**.
-2. Download **DeckPilot_TV_v0.6.0.zip** and extract it into a folder. Do not run the ZIP directly.
-3. Open the extracted `deckpilot_tv_v0_6` folder in Dolphin; right-click the empty area and choose **Open Terminal Here**.
-4. Enter `bash install.sh` and press Enter. No sudo, admin password, Steam password, or Decky needed.
-5. Find **DeckPilot TV** in the application launcher and open it. Choose **Best Graphics**, **Best Performance** or **Balanced**.
+Choose **Best Graphics**, **Best Performance** or **Balanced** globally or per game. Per-game choices survive global default changes and can be saved before installation. Local editing requires an installed compatible config, a closed game, **Preview saved mode**, then **Approve preview and apply**. When a game is not installed or supported, its preference stays saved and reports are advisory. Launch a newly installed game once so it can create its config, then preview and approve. After approval, the service can synchronize that same mode without overwriting newer user/game edits.
 
-The installer keeps your prior app files if upgrading from v0.5, and never removes your existing game preferences or game configuration backups.
+Existing compatible Unreal Engine configs use provisional 1080p/high, 900p/medium or 720p/low starting points. Native Valheim support is limited to existing XML resolution preferences; quality remains advisory. No online text becomes commands/settings, and no Steam launch options, display modes, TDP, Gamescope controls or saves are modified. See [detailed limits](../docs/RESEARCH.md).
 
-## Updates — local ZIP today, GitHub after repository setup
+Restore is available per game in Decky or through the Desktop dashboard. It restores only unchanged managed files, preserves manual edits, keeps backups, and stops future reapplication until approved again. A new preview is needed if config contents change. Upgrading from an older app keeps preferences/backups but requires explicit approval for local settings changes.
 
-To upgrade v0.5 to v0.6, download the accompanying **DeckPilot_TV_v0.6.0.zip** into `~/Downloads`. Open DeckPilot v0.5 and press Install v0.6.0. It should retain game preferences and backups.
+## Installation and updates
 
-v0.6 now supports public GitHub Releases as a feed **once a real repository has been set up**. In DeckPilot's Updates panel enter `owner/repo`, select Connect GitHub and Check online. The app checks automatically every six hours and downloads the latest compatible verified ZIP into its private update folder; it does **not** install without your approval. It accepts only a matching GitHub asset with a GitHub-issued SHA256 digest. The existing rollback feature remains. To prevent arbitrary download sources, the app supports only GitHub release APIs and GitHub-hosted assets. Trust the chosen repository; publisher signing is not separately implemented.
+For a reviewed/published release, extract `DeckPilot_TV_v0.8.0.zip` in Desktop Mode and run its `install.sh` once. The installer runs as your user and keeps existing preferences/backups. This development branch does not publish a release or provide an on-device verified binary.
 
-There is **no GitHub repository connected or published by this ZIP alone**. Creating a GitHub repo and publishing signed/trusted releases is a separate initial step. Until then, v0.6 still accepts new ZIPs saved in Downloads as before.
+After initial setup, use the existing trusted GitHub release feed for automatic checks/downloads and the Decky **Approve install** / **Undo last app update** controls. The Desktop dashboard can connect/disconnect a trusted `owner/repo` feed. Installation requires explicit approval, a GitHub-issued SHA256 digest, strict ZIP/manifest validation and a successful restart check; rollback remains available. A missing release, blocked API or rate limit is reported separately. No routine manual Konsole commands are required after installation.
 
-## Gaming Mode / Decky
+## Private diagnostics
 
-The intended controller-first interface is a Decky Loader plugin. Source and a build workflow are available separately, but a compiled, tested Decky plugin is **not included** in this app ZIP. Decky plugin dependencies could not be downloaded in the build environment. After a repository exists, GitHub Actions can compile and publish it, and it can be installed from Decky without requiring Desktop Mode for mode selection. The core application continues to run in the background, preserving your per-game profiles.
+The Desktop dashboard's **Diagnostics and private Google Drive** section can export a local ZIP for review. Uploads are **off by default**. Connect Drive once through **DeckPilot - Connect Drive**, review an export, then enable uploads only if wanted. OAuth credentials remain with rclone; its `drive.file` scope limits access to files it creates. Google/rclone OAuth configuration may require a separate free OAuth client if shared credentials no longer work.
 
-## Optional Google Drive diagnostics — one visible file
+Uploads overwrite only `My Drive / DeckPilot Diagnostics / DeckPilot-Latest.zip`. DeckPilot never creates public sharing links. Reports omit raw game configs and manifests and redact sensitive log data, but redaction is best-effort; review before sharing. Display diagnostics distinguish supported adapters and unsupported games, advertised modes/VRR capability, and unknown active mode/VRR enabled status.
 
-The DeckPilot dashboard has a **Diagnostics and private Google Drive** section. After connecting Google Drive, the app can periodically replace the same file in the private folder:
+## Development validation
 
-`My Drive / DeckPilot Diagnostics / DeckPilot-Latest.zip`
-
-It does not create dated copies or delete your other Drive documents. It checks about every 10 minutes, throttles uploads when reports are unchanged, and uses **only one fixed destination filename**. OAuth access is stored by rclone on your Steam Deck; DeckPilot never asks for a Google password. The configured rclone scope is `drive.file`, limiting access to items the connection creates.
-
-**One-time setup:**
-
-1. In Desktop Mode, open the application launcher and select **DeckPilot - Connect Drive**.
-2. The helper downloads the official rclone binary (into your home folder if needed) and attempts to open your browser for Google authorisation.
-3. Finish Google's approval screens. Never share OAuth tokens with ChatGPT.
-4. Open DeckPilot TV. In **Diagnostics and private Google Drive**, first export and review a report, then press **Enable Drive uploads**.
-5. Once uploaded, you can ask ChatGPT to check the latest Drive report via your connected Google Drive account.
-
-This connection has not been tested live on SteamOS. **Google's OAuth compatibility may require extra setup:** the official rclone documentation warns its shared Google client ID is being retired during 2026. If the one-click connection fails, see [rclone's Google Drive guide](https://rclone.org/drive/) for creating a separate free OAuth client, or export a report locally. No extra OpenAI charges are needed. ChatGPT does **not** automatically receive a message, proactively inspect the logs or publish fixes merely because a file appeared in Drive.
-
-**Privacy:** log redaction is best-effort, not guaranteed. Review the local ZIP before enabling automatic Drive uploads. Reports exclude raw game configuration files and Steam manifest paths; app log lines may still include sensitive details. Drive upload remains OFF by default.
-
-## What the game optimiser actually does
-
-- Detects installed Steam games in the default library and additional library folders detected through Steam's `libraryfolders.vdf`.
-- Applies one of three broad presets to **existing compatible Unreal Engine `GameUserSettings.ini` files in Proton prefixes**. Other games appear in the library but are not changed.
-- Graphics starts around 1080p/High, Balanced around 900p/Medium and Performance around 720p/Low for supported UE configs. These are *provisional starting points*, not independently benchmarked optimal values.
-- Never edits an apparently running game. Backs up original game config files before edits. Skips later manual edits unless the user forces a per-game selection.
-- Reads existing properly attributed MangoHud CSV logs for observed FPS, but does not install/enable MangoHud logging or perform universal benchmarking.
-- Leaves TV display mode, VRR switching, Gamescope scaling, SteamOS TDP/FPS controls, Steam launch options and unsupported in-game menus untouched.
-
-For a game-specific problem, see the dashboard's **Safety and restore** section. Existing profiles and backups remain after updating DeckPilot.
-
-## Test / diagnostics
-
-Inside the extracted folder:
+From the repository root:
 
 ```bash
-python3 -m unittest discover -v
-bash -n install.sh setup_drive.sh uninstall.sh
+python3 -m unittest discover -s app -v
+bash -n app/install.sh app/setup_drive.sh app/uninstall.sh app/check.sh
 ```
 
-App diagnostics after installing:
-
-```bash
-python3 ~/.local/share/deckpilot-tv/app/deckpilot.py diagnose
-python3 ~/.local/share/deckpilot-tv/app/deckpilot.py cloud-status
-python3 ~/.local/share/deckpilot-tv/app/deckpilot.py update-status
-```
-
-Uninstall shortcut and service by running `bash uninstall.sh` from the extracted folder; saved game settings, backups, the Google remote and Drive files are not deleted.
+Tests mock third-party services. Live source access, Drive OAuth/upload, SteamOS user services and Deck/dock/TV performance still need device validation. Saved preferences and backups are retained on uninstall.

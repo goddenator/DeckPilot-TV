@@ -1,1 +1,1 @@
-DeckPilot TV v0.6.0
+DeckPilot TV v0.8.0

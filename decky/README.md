@@ -1,15 +1,17 @@
-# DeckPilot TV — Decky Loader plugin source
+# DeckPilot TV Decky plugin v0.8.0
 
-**NOT an installable Decky ZIP yet.** This is a development source release. `dist/index.js` must be built from `src/index.tsx` before creating a Decky plugin ZIP. The ChatGPT build environment could not access npm; no device or real Decky runtime test has taken place. Do not try to install the source ZIP through Decky.
+Install the separately built plugin through Decky Loader after the DeckPilot user service is installed. Routine use is in Gaming Mode: three default modes, Steam-wide name/App ID search, installed/saved game selection, per-game modes, independent community reports, preview/approval, restore, display diagnostics, and approved app update/rollback controls.
 
-This plugin uses the documented Decky React/Python bridge, and connects to the locally installed DeckPilot TV user-space application (v0.6+). No root access is requested by the plugin.
+Search results show App IDs to distinguish similar titles. Research verifies the selected identity with Steam before querying Deck Settings / deckverified.games, ShareDeck and SteamDeckHQ. Saving a mode for an uninstalled game persists the App ID preference; preview compatible settings after installation/first launch. Unknown games stay advisory. Source failures do not prevent offline preferences or safe local adapters from working.
 
-On a Linux development environment with Node and npm access:
+The Python bridge resolves the actual `deck` account and drops root's UID/GID/supplementary groups for **every** app subprocess. It sets the deck user's home, XDG runtime/config/data directories and D-Bus session for user-space updates. It fails closed on an account/home mismatch. It never invokes shell commands from online reports.
 
-```
-cd decky
-npm install
+Build from this directory with Node 22+:
+
+```bash
+npm ci
+npm run typecheck
 npm run build
 ```
 
-Confirm `dist/index.js` was generated. Package `DeckPilot/` containing `dist/index.js`, `plugin.json`, `package.json`, `main.py` and `LICENSE` into a ZIP. Install through Decky → Settings → Developer → Install Plugin from ZIP. This is an experimental third-party plugin and is not listed in the Decky Store.
+The root packaging helper includes `dist/index.js` in the plugin ZIP. Generated bundles/node_modules are ignored; the lockfile is committed. Actual controller behavior, external link navigation and SteamOS identity/session handling still require on-device validation. See [source and adapter limits](../docs/RESEARCH.md).

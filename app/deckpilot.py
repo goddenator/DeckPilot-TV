@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""DeckPilot TV 0.6: cautious Steam Deck game preset synchronizer.
+"""DeckPilot TV 0.8: cautious Steam Deck game preset synchronizer.
 
-Only edits existing Unreal Engine GameUserSettings.ini files found inside
-Steam Proton prefixes. Does not touch Steam client settings or display mode.
+Only edits allowlisted existing Unreal Engine config files in Steam Proton
+prefixes and native Valheim resolution preferences after preview approval. Does not touch Steam client settings or display mode.
 """
 from __future__ import annotations
 import argparse
@@ -32,7 +32,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = '0.6.0'
+VERSION = '0.8.0'
 APP = 'deckpilot-tv'
 PORT = 38647
 MODES = {'graphics', 'performance', 'balanced'}
@@ -78,9 +78,15 @@ def log(message):
 
 def atomic_json(path, value):
     mkdir()
-    temp = path.with_suffix('.tmp')
-    temp.write_text(json.dumps(value, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
-    temp.replace(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name+'.', delete=False) as f:
+        temp = Path(f.name)
+        try:
+            f.write((json.dumps(value, indent=2, ensure_ascii=False)+'\n').encode('utf-8'))
+            f.flush()
+            os.fsync(f.fileno())
+            temp.replace(path)
+        finally: temp.unlink(missing_ok=True)
 
 
 def read_json(path, default):
@@ -90,6 +96,27 @@ def read_json(path, default):
         return default
 
 
+from functools import wraps
+import fcntl
+TRANSACTION_LOCAL = threading.local()
+
+
+def game_transaction(fn):
+    @wraps(fn)
+    def guarded(*args, **kwargs):
+        with LOCK:
+            if getattr(TRANSACTION_LOCAL, 'active', False): return fn(*args, **kwargs)
+            mkdir()
+            with (BASE / 'settings.lock').open('a') as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                TRANSACTION_LOCAL.active = True
+                try: return fn(*args, **kwargs)
+                finally:
+                    TRANSACTION_LOCAL.active = False
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+    return guarded
+
+
 def config():
     obj = read_json(CONFIG, {})
     if not isinstance(obj, dict): obj = {}
@@ -97,14 +124,382 @@ def config():
     if not isinstance(games, dict):
         games = {}
     return {'enabled': obj.get('enabled', False) is True,
-            'default': obj.get('default', DEFAULT_MODE) if obj.get('default') in MODES else DEFAULT_MODE,
-            'games': {str(k): v for k, v in games.items() if str(k).isdigit() and v in MODES}}
+            'default': obj.get('default', DEFAULT_MODE) if isinstance(obj.get('default'), str) and obj.get('default') in MODES else DEFAULT_MODE,
+            'games': {str(k): v for k, v in games.items() if str(k).isascii() and str(k).isdigit() and isinstance(v, str) and v in MODES},
+            'approved_files': {str(k): [p for p in paths if isinstance(p, str)][:40] for k, paths in obj.get('approved_files', {}).items() if isinstance(paths, list)} if isinstance(obj.get('approved_files'), dict) else {},
+            'approved': {str(k): v for k, v in obj.get('approved', {}).items() if str(k).isascii() and str(k).isdigit() and isinstance(v, str) and v in MODES} if isinstance(obj.get('approved'), dict) else {}}
 
 
 def effective_mode(appid, cfg=None):
     cfg = cfg or config()
     return cfg['games'].get(str(appid), cfg['default'])
 
+
+# Public research is deliberately data-only. None of this text reaches adapters.
+from html.parser import HTMLParser
+from urllib.robotparser import RobotFileParser
+from concurrent.futures import ThreadPoolExecutor, wait
+
+RESEARCH_AGENT = 'DeckPilot/0.8 (+public game-settings research)'
+RESEARCH_HOSTS = {'store.steampowered.com', 'deckverified.games',
+                  'www.sharedeck.games', 'sharedeck.games', 'steamdeckhq.com', 'github.com'}
+RESEARCH_LIMIT = 1024 * 1024
+RESEARCH_TTL = 6 * 3600
+RESEARCH_LOCK = threading.RLock()
+
+
+def steam_id(value):
+    value = str(value)
+    if not re.fullmatch(r'[1-9][0-9]{0,9}', value) or int(value) > 4294967295:
+        raise ValueError('Enter a valid Steam App ID.')
+    return value
+
+
+def public_url(url, hosts=RESEARCH_HOSTS):
+    try:
+        p = urllib.parse.urlsplit(url)
+        return (p.scheme == 'https' and p.hostname in hosts and p.port in (None, 443)
+                and p.username is None and p.password is None)
+    except ValueError:
+        return False
+
+
+class ResearchRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Stay on the same source (www/apex ShareDeck are the same publisher).
+        old = urllib.parse.urlsplit(req.full_url).hostname
+        new = urllib.parse.urlsplit(newurl).hostname
+        if not public_url(newurl) or old.removeprefix('www.') != new.removeprefix('www.'):
+            raise ValueError('Source redirected outside its public host.')
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def public_get(url, deadline):
+    if not public_url(url, RESEARCH_HOSTS - {'github.com'}):
+        raise ValueError('Unapproved public source.')
+    request = urllib.request.Request(url, headers={'User-Agent': RESEARCH_AGENT,
+                                                  'Accept': 'application/json, text/html, text/plain'})
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError('Source deadline exceeded.')
+    with urllib.request.build_opener(ResearchRedirects()).open(request, timeout=min(2, remaining)) as response:
+        if int(response.headers.get('Content-Length', '0')) > RESEARCH_LIMIT:
+            raise ValueError('Source response exceeds size limit.')
+        parts, size = [], 0
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Source deadline exceeded.')
+            chunk = response.read(16384)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > RESEARCH_LIMIT:
+                raise ValueError('Source response exceeds size limit.')
+            parts.append(chunk)
+        return b''.join(parts).decode('utf-8')
+
+
+def research_cached(key, loader, ttl=RESEARCH_TTL):
+    """One bounded private cache; failures are briefly cached without raw errors."""
+    path = BASE / 'research-cache.json'
+    with RESEARCH_LOCK:
+        cache = read_json(path, {})
+        if not isinstance(cache, dict): cache = {}
+        item = cache.get(key, {})
+        if isinstance(item, dict) and isinstance(item.get('at'), (int, float)) and 'value' in item and 0 <= time.time()-item['at'] < (min(ttl, 300) if isinstance(item['value'], dict) and item['value'].get('status') == 'unavailable' else ttl):
+            return item['value']
+    result = loader()
+    with RESEARCH_LOCK:
+        cache = read_json(path, {})
+        if not isinstance(cache, dict): cache = {}
+        cache[key] = {'at': time.time(), 'value': result}
+        cache = dict(sorted(cache.items(), key=lambda kv: kv[1].get('at', 0)
+                            if isinstance(kv[1], dict) else 0)[-64:])
+        mkdir()
+        # This lock is separate from the game/config lock, so slow sources never block apply.
+        atomic_json(path, cache)
+        os.chmod(path, 0o600)
+    return result
+
+
+def permitted_get(url, deadline):
+    parsed = urllib.parse.urlsplit(url)
+    root = 'https://' + parsed.netloc
+    def robots():
+        try:
+            return {'text': public_get(root + '/robots.txt', deadline)}
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404: return {'text': ''}
+            return {'blocked': True}
+        except (OSError, ValueError):
+            return {'blocked': True}
+    rules = research_cached('robots:' + root, robots, 3600)
+    if rules.get('blocked'):
+        raise ValueError('Public access policy could not be verified.')
+    parser = RobotFileParser()
+    parser.parse(rules['text'].splitlines())
+    if not parser.can_fetch('DeckPilot', url):
+        raise ValueError('Source does not permit automated access to this page.')
+    return public_get(url, deadline)
+
+
+def clean_text(value, limit=1200):
+    return re.sub(r'\s+', ' ', str(value or '')).strip()[:limit]
+
+
+class PublicDocument(HTMLParser):
+    """Extract visible text, links and structured data; never execute scripts."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.text, self.links, self.structured = [], [], []
+        self.hidden = 0
+        self.json_script = False
+        self.script_text = ''
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag in ('script', 'style'):
+            self.hidden += 1
+            self.json_script = tag == 'script' and attrs.get('type') in ('application/ld+json', 'application/json')
+            self.script_text = ''
+        if tag == 'a' and attrs.get('href'): self.links.append(attrs['href'])
+
+    def handle_endtag(self, tag):
+        if tag in ('script', 'style'):
+            if self.json_script:
+                try: self.structured.append(json.loads(self.script_text))
+                except (ValueError, RecursionError): pass
+            self.hidden = max(0, self.hidden - 1)
+            self.json_script = False
+        if not self.hidden: self.text.append(' ')
+
+    def handle_data(self, data):
+        if self.json_script: self.script_text += data
+        elif not self.hidden: self.text.append(data)
+
+
+def document(raw):
+    parser = PublicDocument(); parser.feed(raw)
+    return parser
+
+
+def steam_links(links):
+    ids = set()
+    for link in links:
+        p = urllib.parse.urlsplit(link)
+        if p.scheme == 'https' and p.hostname == 'store.steampowered.com':
+            m = re.match(r'^/app/([1-9][0-9]*)(?:/|$)', p.path)
+            if m: ids.add(m.group(1))
+    return ids
+
+
+def steam_game(appid):
+    appid = steam_id(appid)
+    def load():
+        deadline = time.monotonic() + 6
+        data = json.loads(public_get('https://store.steampowered.com/api/appdetails?appids=' + appid + '&l=english', deadline))
+        if not isinstance(data, dict): raise ValueError('Invalid Steam response.')
+        entry = data.get(appid, {})
+        if not isinstance(entry, dict): raise ValueError('Invalid Steam game.')
+        item = entry.get('data', {})
+        if not isinstance(item, dict): raise ValueError('Invalid Steam game details.')
+        if entry.get('success') is not True or str(item.get('steam_appid')) != appid or item.get('type') != 'game':
+            raise ValueError('Steam did not verify this App ID as a game.')
+        return {'appid': appid, 'name': clean_text(item.get('name'), 200), 'verified': True}
+    return research_cached('steam:' + appid, load)
+
+
+def search_steam(query):
+    query = clean_text(query, 120)
+    if not query: return {'ok': True, 'games': []}
+    try:
+        if query.isdigit():
+            return {'ok': True, 'games': [steam_game(query)]}
+        def load():
+            url = 'https://store.steampowered.com/api/storesearch/?' + urllib.parse.urlencode({'term': query, 'l': 'english', 'cc': 'GB'})
+            payload = json.loads(public_get(url, time.monotonic() + 6))
+            if not isinstance(payload, dict) or not isinstance(payload.get('items'), list): raise ValueError('Invalid Steam search results.')
+            result = []
+            for item in payload['items'][:20]:
+                if not isinstance(item, dict) or item.get('type') not in (None, 'app', 'game'): continue
+                try: appid = steam_id(item['id'])
+                except (ValueError, KeyError): continue
+                result.append({'appid': appid, 'name': clean_text(item.get('name'), 200),
+                               'verified': False})  # appdetails is checked on selection, never by name alone
+            return result
+        return {'ok': True, 'games': research_cached('search:' + query.casefold(), load)}
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
+        return {'ok': False, 'games': [], 'error': 'Steam search unavailable or invalid response. Try again later; installed games and saved preferences still work.'}
+
+
+def report_record(source, appid, url, text, date=None, fields=None):
+    """Return only attributable data. No settings or instructions are executable."""
+    text = clean_text(text)
+    fields = fields or {}
+    def labelled(pattern):
+        m = re.search(pattern, text, re.I)
+        return clean_text(m.group(1), 80) if m else None
+    device = clean_text(fields.get('device'), 80) or labelled(r'\b(Steam Deck OLED|Steam Deck LCD|Steam Deck)\b')
+    context = clean_text(fields.get('display_context'), 80) or ('docked' if re.search(r'\bdocked\b', text, re.I) and not re.search(r'\bhandheld\b', text, re.I) else 'handheld' if re.search(r'\bhandheld\b', text, re.I) and not re.search(r'\bdocked\b', text, re.I) else 'unknown')
+    return {'source': source, 'appid': appid, 'url': url,
+            'retrieved_at': dt.datetime.now(dt.timezone.utc).isoformat(),
+            'report_date': clean_text(date, 80) or None,
+            'game_version': clean_text(fields.get('game_version'), 80) or labelled(r'game version\s*[:=]\s*([\w.\-]+)'),
+            'device': device or 'unknown', 'display_context': context,
+            'resolution': clean_text(fields.get('resolution'), 80) or labelled(r'\b(\d{3,4}\s*[x×]\s*\d{3,4})\b'),
+            'fps': clean_text(fields.get('fps'), 80) or labelled(r'\b(\d{1,3}(?:\s*[-–]\s*\d{1,3})?\s*FPS)\b'),
+            'summary': text,
+            'uncertainty': 'Community report, not a DeckPilot benchmark. ' + ('Handheld-only evidence; TV performance is unverified.' if context == 'handheld' else 'Dock/TV configuration and achieved performance are not independently verified.')}
+
+
+def normalize_public_source(payload, source, appid, url):
+    """Adapt documented public schemas without trusting server-side search filtering.
+
+    Schema provenance is recorded in docs/RESEARCH.md. External reviews returned
+    by Deck Verified are deliberately excluded so publishers stay independent.
+    """
+    result = []
+    def emit(fields, link, text, date, report_id=None):
+        if not public_url(link): return
+        record = report_record(source, appid, link, text, date, fields)
+        record['report_id'] = clean_text(report_id, 80) or None
+        record['fps_kind'] = fields.get('fps_kind', 'reported/unspecified')
+        result.append(record)
+    if source == 'Deck Settings / deckverified.games' and isinstance(payload, dict) and 'reports' in payload:
+        if str(payload.get('appId')) != appid: return []
+        for entry in payload.get('reports', [])[:20]:
+            if not isinstance(entry, dict) or not isinstance(entry.get('data'), dict): continue
+            data = entry['data']
+            if str(data.get('app_id')) != appid: continue
+            link = entry.get('html_url', '')
+            # Attributable user report in the publisher's official public reports repo.
+            if not re.fullmatch(r'https://github\.com/DeckSettings/game-reports-steamos/issues/[1-9][0-9]*', link):
+                link = 'https://deckverified.games/app/' + appid
+            fields = {'device': data.get('device'), 'resolution': data.get('game_resolution'),
+                      'fps': data.get('target_framerate'), 'fps_kind': 'target, not measured FPS',
+                      'game_version': data.get('game_version'), 'display_context': data.get('display_context')}
+            text = ' '.join(clean_text(data.get(k), 500) for k in ('summary', 'game_display_settings', 'game_graphics_settings', 'additional_notes'))
+            emit(fields, link, text, entry.get('created_at'), entry.get('number'))
+        return result
+    if source == 'ShareDeck' and isinstance(payload, list):
+        for entry in payload[:20]:
+            if not isinstance(entry, dict) or str(entry.get('app_id')) != appid: continue
+            resolution = None
+            if entry.get('resolution_horizontal') and entry.get('resolution_vertical'):
+                resolution = str(entry['resolution_horizontal'])+'x'+str(entry['resolution_vertical'])
+            fps = entry.get('average_framerate')
+            fields = {'device': entry.get('device'), 'game_version': entry.get('app_build_id'),
+                      'resolution': resolution, 'fps': str(fps)+' FPS' if fps is not None else None,
+                      'fps_kind': 'community reported average, not independently measured',
+                      'display_context': entry.get('display_context')}
+            emit(fields, 'https://sharedeck.games/apps/'+appid, clean_text(entry.get('note')) or 'Community settings report; missing metadata is unknown.', entry.get('created_at'), entry.get('id'))
+        return result
+    if source == 'SteamDeckHQ' and isinstance(payload, list):
+        for entry in payload[:5]:
+            if not isinstance(entry, dict): continue
+            acf = entry.get('acf') if isinstance(entry.get('acf'), dict) else {}
+            meta = entry.get('meta') if isinstance(entry.get('meta'), dict) else {}
+            raw = entry.get('content', {}).get('rendered', '') if isinstance(entry.get('content'), dict) else ''
+            content = document(raw)
+            # A filtered API URL alone is not proof: validate record fields or a unique Steam URL.
+            identity = acf.get('steam_app_id', meta.get('steam_app_id'))
+            linked_ids = steam_links(content.links)
+            if identity is not None:
+                if str(identity) != appid or linked_ids - {appid}: continue
+            elif linked_ids != {appid}: continue
+            link = entry.get('link', '')
+            if not public_url(link, {'steamdeckhq.com'}): continue
+            settings = acf.get('optimized_and_recommended_settings', {})
+            if not isinstance(settings, dict): settings = {}
+            steamos = settings.get('steamos_settings', {})
+            if not isinstance(steamos, dict): steamos = {}
+            fields = {'fps': steamos.get('fps_cap'), 'fps_kind': 'configured cap/target, not measured FPS'}
+            extra = settings.get('game_settings', '')
+            text = ''.join(content.text) + ' ' + (''.join(document(extra).text) if isinstance(extra, str) else '')
+            emit(fields, link, text, entry.get('date'), entry.get('id'))
+        return result
+    return None  # generic public HTML/JSON-LD, with strict record-level identity checks
+
+
+def parse_source_reports(raw, source, appid, url):
+    """Accept exact App ID evidence per report; a search result title is insufficient."""
+    reports = []
+    try: payload = json.loads(raw)
+    except ValueError: payload = None
+    specialized = normalize_public_source(payload, source, appid, url)
+    if specialized is not None: return specialized
+    doc = document(raw) if payload is None else None
+    roots = [payload] if payload is not None else doc.structured
+    def visit(obj, depth=0):
+        if depth > 12 or len(reports) >= 20: return
+        if isinstance(obj, list):
+            for entry in obj[:100]: visit(entry, depth+1)
+        elif isinstance(obj, dict):
+            # Explicit data records only. Do not inherit a parent's ID into other reports.
+            identity = obj.get('steam_app_id', obj.get('steam_appid', obj.get('appid')))
+            content = obj.get('content', obj.get('reviewBody', obj.get('description', obj.get('summary', ''))))
+            if isinstance(content, dict): content = content.get('rendered', '')
+            content = content if isinstance(content, str) else ''
+            parsed = document(content)
+            ids = steam_links(parsed.links)
+            exact = (str(identity) == appid and not (ids - {appid})) if identity is not None else ids == {appid}
+            link = obj.get('url', obj.get('link', url))
+            link = urllib.parse.urljoin(url, link) if isinstance(link, str) else url
+            if exact and content and public_url(link, {urllib.parse.urlsplit(url).hostname}):
+                reports.append(report_record(source, appid, link, ''.join(parsed.text),
+                                              obj.get('datePublished', obj.get('date')), obj))
+                return
+            for value in list(obj.values())[:100]:
+                if isinstance(value, (dict, list)): visit(value, depth+1)
+    for root in roots: visit(root)
+    if not reports and doc and steam_links(doc.links) == {appid} and re.search(r'\b(?:FPS|resolution|handheld|docked)\b', ''.join(doc.text), re.I):
+        # A verified single-game public page. Unknown metadata stays unknown.
+        reports.append(report_record(source, appid, url, ''.join(doc.text)))
+    return reports
+
+
+def source_research(source, url, appid):
+    def load():
+        try:
+            raw = permitted_get(url, time.monotonic() + 8)
+            reports = parse_source_reports(raw, source, appid, url)
+            return {'source': source, 'url': url, 'status': 'ok' if reports else 'no-verified-reports',
+                    'reports': reports, 'message': 'Only exact App ID matches are included.'}
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+            return {'source': source, 'url': url, 'status': 'unavailable', 'reports': [],
+                    'message': 'Source unavailable, denied automated access, timed out, or returned an unsupported format.'}
+    # Keep successes for six hours and failures for five minutes.
+    result = dict(research_cached(source + ':' + appid, load, RESEARCH_TTL))
+    result['page_url'] = ('https://deckverified.games/app/' + appid if source.startswith('Deck Settings') else 'https://sharedeck.games/apps/' + appid if source == 'ShareDeck' else 'https://steamdeckhq.com/')
+    return result
+
+
+def research_game(appid):
+    try: game = steam_game(appid)
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
+        return {'ok': False, 'error': 'Cannot verify this game with Steam. No similarly named game will be substituted.', 'sources': [], 'reports': []}
+    appid = game['appid']
+    sources = [
+        ('Deck Settings / deckverified.games', 'https://deckverified.games/deck-verified/api/v1/game_details?' + urllib.parse.urlencode({'appid': appid, 'include_external': 'false'})),
+        ('ShareDeck', 'https://sharedeck.games/api/experimental/reports?' + urllib.parse.urlencode({'app_id': appid})),
+        ('SteamDeckHQ', 'https://steamdeckhq.com/wp-json/wp/v2/game-reviews/?' + urllib.parse.urlencode({'meta_key': 'steam_app_id', 'meta_value': appid, 'per_page': 5})),
+    ]
+    pool = ThreadPoolExecutor(max_workers=3)
+    futures = {pool.submit(source_research, source, url, appid): (source, url) for source, url in sources}
+    done, pending = wait(futures, timeout=10)
+    results = []
+    for future, (source, url) in futures.items():
+        if future in done:
+            try: results.append(future.result())
+            except Exception: results.append({'source': source, 'url': url, 'status': 'unavailable', 'reports': []})
+        else:
+            future.cancel()
+            results.append({'source': source, 'url': url, 'status': 'timeout', 'reports': []})
+    pool.shutdown(wait=False, cancel_futures=True)
+    reports = [report for result in results for report in result['reports']]
+    reports.sort(key=lambda r: (r['display_context'] == 'docked', 'OLED' in r['device'].upper()), reverse=True)
+    return {'ok': True, 'game': game, 'sources': results, 'reports': reports,
+            'message': 'Reports are advisory. Missing data means unknown, not a performance guarantee. Only local allowlisted adapters can apply settings.'}
 
 def parse_vdf_key(text, key):
     match = re.search(r'^\s*"' + re.escape(key) + r'"\s+"((?:\\.|[^"])*)"', text, re.I | re.M)
@@ -178,6 +573,141 @@ def find_ue_configs(game):
     return result
 
 
+def find_valheim_configs(game, home=None):
+    """Native Unity PlayerPrefs only; never touch saves or Proton registry."""
+    if game['appid'] != '892970': return []
+    root = (Path(home) if home is not None else Path.home()) / '.config/unity3d'
+    path = root / 'IronGate/Valheim/prefs'
+    if not path.is_file() or any(p.is_symlink() for p in [path, *path.parents][:-1]): return []
+    try:
+        transform_valheim(safe_read_text(path), 'balanced')
+    except (OSError, ValueError, UnicodeError): return []
+    return [path]
+
+
+def transform_valheim(raw, mode):
+    # Unity's native Linux XML prefs. Only existing standard resolution integers.
+    # No invented Valheim quality keys, save-file edits, registry changes or commands.
+    import xml.etree.ElementTree as ET
+    if '<!DOCTYPE' in raw.upper() or '<!ENTITY' in raw.upper():
+        raise ValueError('Unsupported XML declarations.')
+    try: root = ET.fromstring(raw)
+    except ET.ParseError as exc: raise ValueError('Unsupported native preferences.') from exc
+    keys = {'Screenmanager Resolution Width': PRESETS[mode]['x'],
+            'Screenmanager Resolution Height': PRESETS[mode]['y']}
+    if root.tag != 'unity_prefs' or any(len(root.findall("pref[@name='"+k+"']")) != 1 for k in keys):
+        raise ValueError('Native resolution preferences not found.')
+    for key, value in keys.items():
+        node = root.find("pref[@name='"+key+"']")
+        if node.get('type') != 'int' or not re.fullmatch(r'\d+', node.text or ''):
+            raise ValueError('Unsupported preference type.')
+        pattern = r'(<pref\b(?=[^>]*\bname=[\"\']' + re.escape(key) + r'[\"\'])[^>]*>)\d+(</pref>)'
+        raw, count = re.subn(pattern, lambda m: m[1]+str(value)+m[2], raw)
+        if count != 1: raise ValueError('Unsupported preference layout.')
+    return raw
+
+
+def adapter_files(game):
+    # Existing UE handling remains an explicit compatible-format adapter.
+    return [(p, 'unreal') for p in find_ue_configs(game)] + [(p, 'valheim-native') for p in find_valheim_configs(game)]
+
+
+def transform_adapter(path, raw, mode, adapter):
+    if adapter == 'unreal': return transform_ue_ini(raw, mode)
+    if adapter == 'valheim-native': return transform_valheim(raw, mode)
+    raise ValueError('No allowlisted adapter.')
+
+
+@game_transaction
+def save_mode(mode, appid=None):
+    if not isinstance(mode, str) or mode not in MODES: raise ValueError('Unknown optimisation mode.')
+    if appid is not None: appid = steam_id(appid)
+    with LOCK:
+        cfg = config()
+        cfg['enabled'] = True
+        if appid:
+            cfg['games'][appid] = mode
+            cfg['approved'].pop(appid, None)
+            cfg['approved_files'].pop(appid, None)
+        else:
+            cfg['default'] = mode
+            # Preserve deliberate per-game preferences when changing the default.
+            cfg['approved'] = {k: v for k, v in cfg['approved'].items() if k in cfg['games']}
+        atomic_json(CONFIG, cfg)
+    return {'ok': True, 'mode': mode, 'message': 'Preference saved by Steam App ID. Preview and approve local changes when installed; unsupported games remain advisory.'}
+
+
+@game_transaction
+def preview_profile(appid, mode):
+    appid = steam_id(appid)
+    if not isinstance(mode, str) or mode not in MODES: raise ValueError('Unknown mode.')
+    game = next((g for g in installed_games() if g['appid'] == appid), None)
+    if not game: return {'ok': True, 'status': 'not-installed', 'files': [], 'message': 'Preference can be saved now. Install and launch once, then preview supported settings.'}
+    if game_is_running(appid): return {'ok': True, 'status': 'running', 'files': [], 'message': 'Close the game before previewing or applying.'}
+    files, fingerprints = [], []
+    state = read_json(STATE, {})
+    if not isinstance(state, dict): return {'ok': False, 'error': 'Invalid local backup state; no changes approved.'}
+    for path, adapter in adapter_files(game):
+        try:
+            raw = safe_read_text(path)
+            changed = transform_adapter(path, raw, mode, adapter)
+            rel_id = hashlib.sha256(str(path).encode()).hexdigest()[:16]
+            old = state.get(rel_id, {})
+            if not isinstance(old, dict): raise ValueError('Invalid backup record.')
+            manual = bool(old.get('after_sha') and sha(raw) != old['after_sha'])
+            fingerprints.append([str(path), sha(raw), sha(changed)])
+            # Only allowlisted settings lines are shown, never raw unrelated user configuration.
+            if adapter == 'unreal':
+                allowed = set(SCALABILITY_KEYS + GAME_KEYS + ['sg.ResolutionQuality'])
+                def values(text):
+                    return {m[1]: m[2] for m in re.finditer(r'^\s*([\w.]+)\s*=\s*([^\r\n]*)', text, re.M) if m[1] in allowed}
+                before, after = values(raw), values(changed)
+            else:
+                before = dict(re.findall(r'<pref[^>]+name="(Screenmanager Resolution (?:Width|Height))"[^>]*>(\d+)</pref>', raw))
+                after = dict(re.findall(r'<pref[^>]+name="(Screenmanager Resolution (?:Width|Height))"[^>]*>(\d+)</pref>', changed))
+            files.append({'file': path.name, 'adapter': adapter, 'manual_changes': manual,
+                          'changes': [{'key': k, 'before': before.get(k), 'after': v} for k, v in after.items() if before.get(k) != v]})
+        except (OSError, ValueError, UnicodeError):
+            return {'ok': False, 'status': 'unreadable', 'files': [], 'error': 'A supported config cannot be safely read. No changes approved.'}
+    if not files: return {'ok': True, 'status': 'unsupported', 'files': [], 'message': 'No compatible local adapter. Research and mode preference are advisory only.'}
+    token = sha(json.dumps([appid, mode, fingerprints], sort_keys=True))
+    return {'ok': True, 'status': 'preview', 'appid': appid, 'mode': mode, 'files': files, 'paths': [p[0] for p in fingerprints], 'token': token,
+            'message': 'Conservative local starting points, not downloaded report instructions or measured optimal settings. Manual/game edits will be skipped. Backups precede every first edit.'}
+
+
+@game_transaction
+def approve_profile(appid, mode, token):
+    appid = steam_id(appid)
+    with LOCK:
+        preview = preview_profile(appid, mode)
+        if preview.get('status') != 'preview' or not secrets.compare_digest(str(preview.get('token', '')), str(token)):
+            return {'ok': False, 'error': 'Preview changed or game is running. Preview again before applying.'}
+        game = next(g for g in installed_games() if g['appid'] == appid)
+        # Never force manual changes, even after approval; preserve the user's newer edits.
+        result = apply_profile(game, mode, allowed_files=preview['paths'])
+        if result['status'] in ('applied', 'already-set'):
+            cfg = config(); cfg['games'][appid] = mode; cfg['enabled'] = True; cfg['approved'][appid] = mode
+            cfg['approved_files'][appid] = preview['paths']
+            atomic_json(CONFIG, cfg)
+        return {'ok': result['status'] in ('applied', 'already-set'), 'result': result,
+                'message': 'Local settings: ' + result['status'] + '. Manual/game changes are preserved.'}
+
+
+def display_diagnostics(drm_root=Path('/sys/class/drm')):
+    outputs = []
+    for connector in drm_root.glob('card*-*'):
+        if not re.search(r'-(DP|HDMI|DVI)-', connector.name, re.I): continue
+        try:
+            if (connector/'status').read_text().strip() != 'connected': continue
+            modes = (connector/'modes').read_text().splitlines()[:40] if (connector/'modes').is_file() else []
+            outputs.append({'connector': connector.name, 'advertised_modes': modes})
+        except OSError: continue
+    return {'external_outputs': outputs, 'vrr_capability': external_vrr_capability(drm_root),
+            'vrr_enabled': 'unknown', 'active_mode': 'unknown',
+            'note': 'Advertised resolutions/capability do not establish active refresh rate or VRR. Check SteamOS Display settings; official dock supports up to 4K60 or 1440p120 depending on connection.'}
+
+
+
 def parse_ini_sections(text):
     # Preserve full text and comments; edit only known key assignments.
     return re.split(r'(?=^\s*\[[^\r\n]+\]\s*$)', text, flags=re.M)
@@ -216,7 +746,7 @@ def transform_ue_ini(raw, mode):
                         revised.append(match.group(1) + match.group(2) + match.group(3) + group_map[name] + match.group(5))
                         existing.add(name)
                     else:
-                        revised.append(line)  # don't remove duplicates in an unknown file
+                        raise ValueError('Duplicate settings key; use the game menu to resolve it first.')
                     continue
             revised.append(line)
         if revised and not revised[-1].endswith(('\n', '\r')):
@@ -244,7 +774,8 @@ def sha(text):
 def safe_read_text(path):
     # Unreal config files are typically UTF-8, but many game launchers save
     # UTF-16. We avoid modifying encodings we cannot safely round-trip.
-    data = path.read_bytes()
+    with path.open('rb') as handle:
+        data = handle.read(2_000_001)
     if b'\x00' in data or len(data) > 2_000_000:
         raise ValueError('unsupported encoding or size')
     return data.decode('utf-8-sig')
@@ -263,6 +794,9 @@ def game_is_running(appid):
         try:
             blob = (item / 'environ').read_bytes()
         except (OSError, PermissionError):
+            try:
+                if item.stat().st_uid == os.getuid(): return True
+            except FileNotFoundError: pass
             continue
         if (b'SteamAppId=' + appid.encode() + b'\x00') in b'\x00' + blob + b'\x00':
             return True
@@ -271,25 +805,36 @@ def game_is_running(appid):
     return False
 
 
-def apply_profile(game, mode, force=False):
+@game_transaction
+def apply_profile(game, mode, force=False, allowed_files=None):
     """Returns status. Only modifies supported existing files when no game runs."""
-    files = find_ue_configs(game)
+    files = adapter_files(game)
+    if allowed_files is not None:
+        files = [(p, a) for p, a in files if str(p) in allowed_files]
     if not files:
         return {'status': 'unsupported', 'count': 0}
     if game_is_running(game['appid']):
         return {'status': 'running', 'count': 0}
     previous = read_json(STATE, {})
+    if not isinstance(previous, dict): return {'status': 'error', 'count': 0}
     changed = 0
     skipped_manual = 0
     backups = 0
-    for path in files:
+    errors = 0
+    for path, adapter in files:
         try:
             original = safe_read_text(path)
-            updated = transform_ue_ini(original, mode)
+            updated = transform_adapter(path, original, mode, adapter)
             if updated == original:
                 continue
             rel_id = hashlib.sha256(str(path).encode()).hexdigest()[:16]
             old = previous.get(rel_id, {})
+            if not isinstance(old, dict): raise ValueError('Invalid backup record.')
+            if old:
+                saved_backup = Path(old.get('backup', ''))
+                if (not saved_backup.is_file() or saved_backup.is_symlink()
+                        or not saved_backup.resolve().is_relative_to(BACKUPS.resolve())):
+                    raise ValueError('Original backup missing or unsafe; no changes made.')
             if old.get('after_sha') and sha(original) != old['after_sha']:
                 # A game or user changed these settings since our last edit.
                 # Never override this change during automatic syncing.
@@ -299,44 +844,66 @@ def apply_profile(game, mode, force=False):
                     skipped_manual += 1
                     log('SKIP user/game changed file ' + str(path))
                     continue
-                reselect = BACKUPS / game['appid'] / (rel_id + '.before-reselect.ini')
+                reselect = BACKUPS / game['appid'] / (rel_id + '.' + secrets.token_hex(6) + '.before-reselect.ini')
                 shutil.copy2(path, reselect)
                 old['backup'] = str(reselect)
             # Keep a backup of the user's ORIGINAL, not each later DeckPilot
             # edit. Always back up before modifying an existing configuration.
             backdir = BACKUPS / game['appid']
             backup = backdir / (rel_id + '.original.ini')
+            if not old and backup.exists():
+                backup = backdir / (rel_id + '.' + secrets.token_hex(6) + '.original.ini')
             backdir.mkdir(parents=True, exist_ok=True)
             if not backup.exists():
                 shutil.copy2(path, backup)
                 backups += 1
-            temp = path.with_name(path.name + '.deckpilot.tmp')
-            temp.write_bytes(updated.encode('utf-8'))
-            os.chmod(temp, path.stat().st_mode & 0o777)
-            temp.replace(path)
-            previous[rel_id] = {'appid': game['appid'], 'file': str(path),
-                                'backup': old.get('backup', str(backup)), 'mode': mode, 'after_sha': sha(updated)}
+            managed_backup = Path(old.get('backup', str(backup)))
+            if (not managed_backup.is_file() or managed_backup.is_symlink()
+                    or not managed_backup.resolve().is_relative_to(BACKUPS.resolve())):
+                raise ValueError('Original backup is missing or unsafe; no changes made.')
+            temp = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name+'.deckpilot.', delete=False) as f:
+                    temp = Path(f.name)
+                    f.write(updated.encode('utf-8')); f.flush(); os.fsync(f.fileno())
+                os.chmod(temp, path.stat().st_mode & 0o777)
+                previous[rel_id] = {'appid': game['appid'], 'file': str(path),
+                                    'backup': old.get('backup', str(backup)), 'mode': mode, 'after_sha': sha(updated)}
+                atomic_json(STATE, previous)
+                temp.replace(path)
+            finally:
+                if temp is not None: temp.unlink(missing_ok=True)
             changed += 1
         except (OSError, UnicodeError, ValueError) as ex:
+            errors += 1
             log('SKIP ' + game['appid'] + ' ' + str(path) + ': ' + str(ex))
     if changed:
         atomic_json(STATE, previous)
         log('APPLY ' + game['appid'] + ' ' + game['name'] + ' mode=' + mode + ' files=' + str(changed))
-    return {'status': 'applied' if changed else ('manual-changes' if skipped_manual else 'already-set'),
+    return {'status': 'error' if errors else ('manual-changes' if skipped_manual else ('applied' if changed else 'already-set')),
             'count': changed, 'backups': backups, 'skipped_manual': skipped_manual}
 
 
+@game_transaction
 def restore_game(appid):
     if game_is_running(appid):
         return 'Game appears to be running. Close it before restoring.'
+    cfg = config()
+    cfg['approved'].pop(appid, None)
+    cfg['approved_files'].pop(appid, None)
+    atomic_json(CONFIG, cfg)
     state = read_json(STATE, {})
+    if not isinstance(state, dict): return 'Invalid backup state. No files changed.'
     n = 0
     for k, v in list(state.items()):
-        if v.get('appid') != appid:
+        if not isinstance(v, dict) or v.get('appid') != appid:
             continue
+        if not isinstance(v.get('file'), str) or not isinstance(v.get('backup'), str): continue
         path = Path(v['file'])
         backup = Path(v['backup'])
-        if not backup.is_file() or not path.is_file():
+        if (not backup.is_file() or not path.is_file() or path.is_symlink() or backup.is_symlink()
+                or any(p.is_symlink() for p in path.parents)
+                or not backup.resolve().is_relative_to(BACKUPS.resolve())):
             continue
         try:
             current = safe_read_text(path)
@@ -508,6 +1075,7 @@ def redact_diagnostic(text):
         text = text.replace(home, '[HOME]')
     text = re.sub(r'(?i)\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b', '[REDACTED_KEY]', text)
     text = re.sub(r'(?i)\b(authorization\s*[:=]\s*(?:Bearer\s+)?)\S+', r'\1[REDACTED]', text)
+    text = re.sub(r'(?i)([\"\'](?:password|secret|token|access_token|refresh_token|api_key)[\"\']\s*:\s*[\"\'])[^\"\']+', r'\1[REDACTED]', text)
     text = re.sub(r'(?i)\b(password|secret|token|apikey|api_key)\s*[:=]\s*[^\s,;]+', r'\1=[REDACTED]', text)
     text = re.sub(r'(?i)[\w.+-]+@[\w.-]+\.[a-z]{2,}', '[EMAIL]', text)
     text = re.sub(r'(?<!\w)(?:\d{1,3}\.){3}\d{1,3}(?!\w)', '[IP]', text)
@@ -520,7 +1088,7 @@ def diagnostic_report():
     """Aggregate technical indicators only; no raw config, library paths or keys."""
     games = installed_games()
     cfg = config()
-    file_count = sum(bool(find_ue_configs(g)) for g in games)
+    file_count = sum(bool(adapter_files(g)) for g in games)
     state = read_json(STATE, {})
     try:
         raw_log = LOG.read_text(encoding='utf-8', errors='replace')[-100_000:]
@@ -544,6 +1112,9 @@ def diagnostic_report():
         'per_game_overrides': len(cfg['games']),
         'known_backup_records': len(state) if isinstance(state, dict) else 0,
         'external_vrr_advertised': external_vrr_capability(),
+        'display': display_diagnostics(),
+        'unsupported_games': len(games) - file_count,
+        'adapter_counts': {name: sum(any(a == name for _, a in adapter_files(g)) for g in games) for name in ('unreal', 'valheim-native')},
         'log_lines': lines, 'errors': [l for l in lines if re.search(r'(?i)\b(error|exception|traceback|failed)\b', l)][-40:],
         'notes': ['Google Drive upload is optional and requires enabling it in DeckPilot.', 'Log redaction is best-effort; review before sharing.',
                   'VRR capability is not proof VRR is active.', 'No raw game configuration files are included.']
@@ -775,15 +1346,17 @@ def state_for_ui():
     cfg = config()
     result = []
     for g in games:
-        has_adapter = bool(find_ue_configs(g))
+        adapters = adapter_files(g)
+        has_adapter = bool(adapters)
         mode = effective_mode(g['appid'], cfg)
         metrics = game_metrics(g)
         result.append({'appid': g['appid'], 'name': g['name'], 'mode': mode,
-                       'adapter': 'Unreal Engine config' if has_adapter else 'No supported config found',
+                       'adapter': ', '.join(sorted({a for _, a in adapters})) if has_adapter else 'Advisory only',
+                       'approved': cfg['approved'].get(g['appid']) == mode,
                        'supported': has_adapter, 'metrics': metrics, 'hint': mode_hint(mode, metrics)})
     return {'version': VERSION, 'enabled': cfg['enabled'], 'default': cfg['default'], 'games': result, 'count': len(result),
             'supported': sum(1 for g in result if g['supported']),
-            'vrr_capability': external_vrr_capability(), 'cloud': cloud_status()}
+            'vrr_capability': external_vrr_capability(), 'display': display_diagnostics(), 'saved_games': cfg['games'], 'cloud': cloud_status()}
 
 
 WEB = r'''<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -802,26 +1375,32 @@ input{width:100%;border:1px solid #41516b;border-radius:10px;background:#0d1622;
 #feedback{min-height:24px;margin-top:11px;color:#9ee2c7}
 @media(max-width:700px){.game{display:block}.game .modes{min-width:0;margin-top:10px}.modes{gap:5px}button{padding:10px 4px;font-size:12px}}
 </style></head><body>
-<div class="top"><div><h1>DeckPilot <span style="color:#5fe9de">TV</span></h1><p>Steam Deck OLED · Official Dock · 4K / 120Hz VRR TV</p></div><span class="tag">v0.6 · Online update ready</span></div>
-<div class="box"><h2>Default optimisation</h2><p>Choose one mode. New or unconfigured games inherit it automatically.</p>
+<div class="top"><div><h1>DeckPilot <span style="color:#5fe9de">TV</span></h1><p>Steam Deck OLED · Official Dock · 4K / 120Hz VRR TV</p></div><span class="tag">v0.8 · Community research</span></div>
+<div class="box"><h2>Default optimisation</h2><p>Choose one mode. Games without overrides inherit it; preview and approve local edits per game.</p>
 <div id="defaults" class="modes"></div><div id="feedback" role="status"></div></div>
 <div class="notice" style="margin-bottom:13px"><b>VRR / FreeSync:</b> <span id="vrr">Checking connected output…</span><br><small>This is a read-only capability check, not an enabled/disabled switch. SteamOS controls VRR; DeckPilot does not change display or TV settings.</small></div>
-<div class="notice"><b>Safe first version:</b> applies conservative graphics and resolution presets only to detected Unreal Engine configuration files. Other games are identified but not modified. It does not change SteamOS display, FPS limits, TDP or Steam launch options. Original config files are backed up before edits. If a compatible MangoHud CSV already exists, DeckPilot reports recorded FPS, but it does not silently change your Steam overlay or claim to benchmark every game.</div>
+<div class="notice"><b>Safe first version:</b> offers conservative local presets for compatible Unreal Engine configs and native Valheim resolution preferences after preview and approval. Other games are identified but not modified. It does not change SteamOS display, FPS limits, TDP or Steam launch options. Original config files are backed up before edits. If a compatible MangoHud CSV already exists, DeckPilot reports recorded FPS, but it does not silently change your Steam overlay or claim to benchmark every game.</div>
+<div class="box"><h2>Steam-wide research</h2><input id="steam-query" aria-label="Steam game name or App ID" placeholder="Name or Steam App ID (including uninstalled)"/><button onclick="steamSearch()">Search Steam</button><div id="steam-results"></div><div id="research-results"></div></div>
 <div class="box"><div class="top"><div><h2 style="margin:0">Installed Steam games</h2><p id="count">Scanning library…</p></div><button onclick="refresh()">Rescan</button></div>
 <input id="search" placeholder="Find a game…" oninput="drawGames()" aria-label="Find installed game"/><div id="games"></div></div>
 <div class="box"><div class="top"><div><h2 style="margin:0">Updates</h2><p id="update-status">Checking for a newer version…</p></div><button id="install-update" onclick="installUpdate()" disabled>No update yet</button></div><p id="github-status">GitHub releases: not connected.</p><input id="github-repo" placeholder="GitHub repository: owner/name" aria-label="GitHub release repository"/><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button onclick="connectGithub()">Connect GitHub</button><button onclick="checkGithub()">Check online</button><button onclick="disconnectGithub()">Disconnect</button><button id="undo-update" onclick="undoUpdate()" style="display:none">Undo last update</button></div><small>After connecting a public GitHub releases repository, DeckPilot checks and downloads verified ZIPs in the background. You choose when to install. Until a repository is published, the existing Downloads ZIP method still works. GitHub digest and HTTPS checks provide integrity but are not a separate developer signature.</small></div>
 <details class="box"><summary style="cursor:pointer;font-weight:700">Safety and restore</summary><p>DeckPilot keeps original copies before editing supported settings. Close your games before restoring. Files changed by a game after DeckPilot's edits will be left alone.</p><button onclick="restoreAll()">Restore all DeckPilot changes</button></details>
 <details class="box"><summary style="cursor:pointer;font-weight:700">Diagnostics and private Google Drive</summary><p>Optional: keep ONE constantly updated <b>DeckPilot-Latest.zip</b> in your private <b>DeckPilot Diagnostics</b> folder. No paid ChatGPT API. Reports include redacted app logs only, but redaction is best-effort. Review a local export before opting in. Connect Google Drive once using the <b>DeckPilot - Connect Drive</b> shortcut in the Desktop Mode application launcher. Nothing is uploaded until you enable it below.</p><p id="cloud-status">Checking connection…</p><button onclick="exportReport()">Export diagnostic ZIP</button> <button onclick="toggleCloud(true)">Enable Drive uploads</button> <button onclick="toggleCloud(false)">Disable Drive uploads</button> <button onclick="uploadNow()">Upload latest now</button><p id="export-status"></p></details>
-<p><small>DeckPilot never needs root access or your Steam password. MangoHud logs are optional and are only read when they can be reliably matched to a game. It cannot optimise games whose graphics settings are stored in unsupported formats. Changes to a game may not take effect until it is relaunched. To restore backups, run the included Restore shortcut or command.</small></p>
+<p><small>DeckPilot never needs root access or your Steam password. MangoHud logs are optional and are only read when they can be reliably matched to a game. It cannot optimise games whose graphics settings are stored in unsupported formats. Changes to a game may not take effect until it is relaunched. Use the Safety and restore controls or the per-game Decky restore action to undo unchanged managed files.</small></p>
 <script>
 let info={default:'balanced',games:[]};const choices=[['graphics','Best Graphics'],['performance','Best Performance'],['balanced','Balanced']];
 const token='__TOKEN__';
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function buttons(mode,appid){return choices.map(([v,name])=>`<button class="${v===mode?'active':''}" onclick="setMode('${v}',${appid?`'${appid}'`:'null'})">${name}</button>`).join('');}
-function drawGames(){let q=document.getElementById('search').value.toLowerCase();let items=info.games.filter(g=>g.name.toLowerCase().includes(q));document.getElementById('games').innerHTML=items.map(g=>`<div class="game"><div><div class="game-title">${esc(g.name)}</div><div class="game-status">${g.supported?'✓ Supported graphics config found':'• Game detected — no supported settings file'}${g.metrics?` · ${g.metrics.avg_fps} FPS avg / ${g.metrics.low_1pct_fps} sampled 1% low`:''}</div></div><div class="modes">${buttons(g.mode,g.appid)}</div></div>`).join('')||'<p>No matching installed games found.</p>'}
-function draw(){const vrrLabels={'available':'Advertised as supported by the connected display','not-advertised':'Not advertised through the current output','unknown':'Could not be verified (check SteamOS Display settings)'};document.getElementById('vrr').innerText=vrrLabels[info.vrr_capability]||vrrLabels.unknown;document.getElementById('defaults').innerHTML=buttons(info.enabled?info.default:'',null);if(!info.enabled)document.getElementById('feedback').innerText='Select a mode to enable automatic optimisation.';document.getElementById('count').innerText=`${info.count} games detected · ${info.supported} with supported settings`;const c=info.cloud||{};document.getElementById('cloud-status').innerText=(c.enabled?'Uploads ON · ':'Uploads OFF · ')+(c.connection||'')+(c.last_success_utc?' · Last upload '+new Date(c.last_success_utc).toLocaleString():'')+' · '+(c.last_status||'');drawGames();}
+function drawGames(){let q=document.getElementById('search').value.toLowerCase();let items=info.games.filter(g=>g.name.toLowerCase().includes(q));document.getElementById('games').innerHTML=items.map(g=>`<div class="game"><div><div class="game-title">${esc(g.name)}</div><div class="game-status">${g.supported?'✓ Compatible local adapter found':'• Game detected — no supported settings file'}${g.metrics?` · ${g.metrics.avg_fps} FPS avg / ${g.metrics.low_1pct_fps} sampled 1% low`:''}</div></div><div class="modes">${buttons(g.mode,g.appid)}</div></div>`).join('')||'<p>No matching installed games found.</p>'}
+function draw(){const vrrLabels={'available':'Advertised as supported by the connected display','not-advertised':'Not advertised through the current output','unknown':'Could not be verified (check SteamOS Display settings)'};document.getElementById('vrr').innerText=vrrLabels[info.vrr_capability]||vrrLabels.unknown;document.getElementById('defaults').innerHTML=buttons(info.enabled?info.default:'',null);if(!info.enabled)document.getElementById('feedback').innerText='Select a mode, then preview and approve supported game changes.';document.getElementById('count').innerText=`${info.count} games detected · ${info.supported} with supported settings`;const c=info.cloud||{};document.getElementById('cloud-status').innerText=(c.enabled?'Uploads ON · ':'Uploads OFF · ')+(c.connection||'')+(c.last_success_utc?' · Last upload '+new Date(c.last_success_utc).toLocaleString():'')+' · '+(c.last_status||'');drawGames();}
 async function refresh(){try{let r=await fetch('/api/state');if(!r.ok)throw Error('Server error');info=await r.json();draw();}catch(e){document.getElementById('feedback').innerText='Could not connect: '+e.message;}}
-async function setMode(mode,appid){try{let r=await fetch('/api/mode',{method:'POST',headers:{'Content-Type':'application/json','X-DeckPilot-Token':token},body:JSON.stringify({mode,appid})});let j=await r.json();if(!r.ok)throw Error(j.error||'Unknown error');document.getElementById('feedback').innerText=j.message;await refresh();}catch(e){document.getElementById('feedback').innerText=e.message;}}
+async function setMode(mode,appid){try{let r=await fetch('/api/mode',{method:'POST',headers:{'Content-Type':'application/json','X-DeckPilot-Token':token},body:JSON.stringify({mode,appid})});let j=await r.json();if(!r.ok)throw Error(j.error||'Unknown error');document.getElementById('feedback').innerText=j.message;await refresh();if(appid)await previewMode(appid,mode);}catch(e){document.getElementById('feedback').innerText=e.message;}}
+async function localAction(path,payload){const r=await fetch('/api/'+path,{method:'POST',headers:{'Content-Type':'application/json','X-DeckPilot-Token':token},body:JSON.stringify(payload)});const j=await r.json();if(!r.ok||j.error)throw Error(j.error||'Request failed');return j;}
+async function previewMode(appid,mode){const p=await localAction('preview',{appid,mode});document.getElementById('feedback').innerText=p.message||p.status;if(!p.token)return;const summary=p.files.map(f=>f.adapter+' '+f.file+(f.manual_changes?' (manual edits: will skip)':'')+'\n'+f.changes.map(c=>c.key+': '+(c.before||'(unset)')+' → '+c.after).join('\n')).join('\n');if(confirm(summary+'\nApprove these local changes? Backups first.')){const r=await localAction('apply',{appid,mode,token:p.token});document.getElementById('feedback').innerText=r.message||r.error;await refresh();}}
+
+async function steamSearch(){try{const r=await localAction('search',{query:document.getElementById('steam-query').value});document.getElementById('steam-results').innerHTML=(r.games||[]).map(g=>`<div class="game"><span>${esc(g.name)} · ${esc(g.appid)}</span><button onclick="researchGame('${g.appid}')">Research</button><div class="modes">${buttons(info.saved_games?.[g.appid]||info.default,g.appid)}</div></div>`).join('')||'<p>No games found.</p>';}catch(e){document.getElementById('feedback').innerText=e.message;}}
+async function researchGame(appid){try{const r=await localAction('research',{appid});document.getElementById('research-results').innerHTML='<p>'+esc(r.message||'')+'</p>'+(r.sources||[]).map(s=>`<p>${esc(s.source)}: ${esc(s.status)}</p>`).join('')+(r.reports||[]).map(s=>`<p><a href="${esc(s.url)}" target="_blank" rel="noreferrer">${esc(s.source)}</a> · ${esc(s.device)} · ${esc(s.display_context)} · ${esc(s.resolution||'unknown resolution')} · ${esc(s.fps||'unknown FPS')} (${esc(s.fps_kind||'reported/unspecified')}) · ${esc(s.report_date||'unknown date')} · ${esc(s.game_version||'unknown game version')}<br>${esc(s.summary)}<br>${esc(s.uncertainty)}</p>`).join('');}catch(e){document.getElementById('feedback').innerText=e.message;}}
 async function exportReport(){try{const r=await fetch('/api/diagnostics',{method:'POST',headers:{'Content-Type':'application/json','X-DeckPilot-Token':token},body:'{}'});if(!r.ok)throw Error('Export failed');const b=await r.blob(),u=URL.createObjectURL(b),a=document.createElement('a');a.href=u;a.download='DeckPilot-Diagnostics.zip';a.click();setTimeout(()=>URL.revokeObjectURL(u),30000);document.getElementById('export-status').innerText='Report generated locally. Review it before sharing.';}catch(e){document.getElementById('export-status').innerText=e.message;}}
 async function cloudAction(action){try{let r=await fetch('/api/cloud',{method:'POST',headers:{'Content-Type':'application/json','X-DeckPilot-Token':token},body:JSON.stringify({action})});let j=await r.json();document.getElementById('export-status').innerText=j.message||j.error||'No response';await refresh();}catch(e){document.getElementById('export-status').innerText=e.message;}}
 async function checkUpdate(){try{const r=await fetch('/api/update');const j=await r.json();const b=document.getElementById('install-update');const t=document.getElementById('update-status');const undo=document.getElementById('undo-update');undo.style.display=j.can_undo?'inline-block':'none';if(j.available){b.disabled=false;b.textContent='Install v'+j.version;t.textContent='Update available: '+j.archive;}else{b.disabled=true;b.textContent='Up to date';t.textContent='v'+(info.version||'')+' installed · '+(j.status||'No newer update.')}const gh=j.github||{};document.getElementById('github-status').textContent=gh.repository?('GitHub: '+gh.repository+' · '+(gh.message||gh.status)):'GitHub releases not connected yet.';if(gh.repository&&!document.getElementById('github-repo').value)document.getElementById('github-repo').value=gh.repository;}catch(e){document.getElementById('update-status').textContent='Update check failed: '+e.message;}}
@@ -839,13 +1418,16 @@ refresh().then(checkUpdate);
 </script></body></html>'''
 
 
+@game_transaction
 def synchronize():
     cfg = config()
     if not cfg['enabled']:
         return
     for g in installed_games():
-        if find_ue_configs(g):
-            apply_profile(g, effective_mode(g['appid'], cfg))
+        mode = effective_mode(g['appid'], cfg)
+        approved_paths = cfg['approved_files'].get(g['appid'], [])
+        if cfg['approved'].get(g['appid']) == mode and approved_paths:
+            apply_profile(g, mode, allowed_files=approved_paths)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -874,7 +1456,7 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get('Origin')
         if origin and origin not in ('http://127.0.0.1:38647', 'http://localhost:38647'):
             self.send_error(403); return
-        if self.path not in ('/api/mode', '/api/restore', '/api/diagnostics', '/api/cloud', '/api/update'): self.send_error(404); return
+        if self.path not in ('/api/mode', '/api/restore', '/api/diagnostics', '/api/cloud', '/api/update', '/api/preview', '/api/apply', '/api/research', '/api/search'): self.send_error(404); return
         if self.headers.get('X-DeckPilot-Token') != self.token:
             self.send_json({'error': 'Invalid session token'}, 403); return
         if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
@@ -884,6 +1466,14 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < length < 1024: raise ValueError('Invalid message length')
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict): raise ValueError('JSON object required')
+            if self.path == '/api/search':
+                self.send_json(search_steam(payload.get('query', ''))); return
+            if self.path == '/api/research':
+                self.send_json(research_game(steam_id(payload['appid']))); return
+            if self.path == '/api/preview':
+                self.send_json(preview_profile(payload['appid'], payload['mode'])); return
+            if self.path == '/api/apply':
+                self.send_json(approve_profile(payload['appid'], payload['mode'], payload['token'])); return
             if self.path == '/api/diagnostics':
                 with LOCK:
                     data = make_diagnostic_zip()
@@ -917,29 +1507,7 @@ class Handler(BaseHTTPRequestHandler):
                     results = [restore_game(g['appid']) for g in installed_games()]
                 self.send_json({'ok': True, 'message': 'Restoration checked for ' + str(len(results)) + ' games. Original files were restored only where it was safe. Check the DeckPilot log for skipped files.'})
                 return
-            mode = payload['mode']
-            appid = payload.get('appid')
-            if mode not in MODES: raise ValueError('Unknown optimisation mode')
-            if appid is not None and (not isinstance(appid, str) or not appid.isdigit()):
-                raise ValueError('Invalid game identifier')
-            with LOCK:
-                games = installed_games()
-                cfg = config()
-                if appid is None:
-                    cfg['enabled'] = True
-                    cfg['default'] = mode
-                    cfg['games'] = {}  # global choice resets prior per-game overrides
-                    atomic_json(CONFIG, cfg)
-                    msg = 'Default changed. Supported games will be updated automatically.'
-                else:
-                    target = next((g for g in games if g['appid'] == appid), None)
-                    if target is None: raise ValueError('Game was not found in installed library')
-                    cfg['enabled'] = True
-                    cfg['games'][appid] = mode
-                    atomic_json(CONFIG, cfg)
-                    result = apply_profile(target, mode, force=True)
-                    msg = target['name'] + ': ' + (('settings updated (' + str(result['count']) + ' file)' if result['count'] == 1 else 'settings updated (' + str(result['count']) + ' files)') if result['count'] else ('not modified: supported config not found' if result['status'] == 'unsupported' else ('game appears to be running; try after closing it' if result['status'] == 'running' else ('manual/game edits detected; not overwritten automatically' if result['status'] == 'manual-changes' else 'settings already match'))))
-            self.send_json({'ok': True, 'message': msg})
+            self.send_json(save_mode(payload['mode'], payload.get('appid')))
         except (ValueError, KeyError, json.JSONDecodeError) as ex:
             self.send_json({'error': str(ex)}, 400)
 
@@ -991,10 +1559,20 @@ def run_server():
 
 def main():
     parser = argparse.ArgumentParser(description='DeckPilot TV: Steam Deck OLED docked game optimiser')
-    parser.add_argument('command', choices=['serve', 'scan', 'apply', 'restore', 'status', 'diagnose', 'export', 'cloud-status', 'cloud-upload', 'cloud-enable', 'cloud-disable', 'update-status', 'set-mode', 'plugin-state', 'check-github', 'install-update', 'rollback-update'])
+    parser.add_argument('command', choices=['serve', 'scan', 'apply', 'restore', 'status', 'diagnose', 'export', 'cloud-status', 'cloud-upload', 'cloud-enable', 'cloud-disable', 'update-status', 'set-mode', 'plugin-state', 'check-github', 'install-update', 'rollback-update', 'search', 'research', 'preview', 'approve'])
     parser.add_argument('appid', nargs='?')
     parser.add_argument('--mode', choices=sorted(MODES))
+    parser.add_argument('--preview-token', default='')
     args = parser.parse_args()
+    if args.command in ('search', 'research', 'preview', 'approve'):
+        try:
+            if args.command == 'search': result = search_steam(args.appid or '')
+            elif args.command == 'research': result = research_game(steam_id(args.appid))
+            elif args.command == 'preview': result = preview_profile(args.appid, args.mode)
+            else: result = approve_profile(args.appid, args.mode, args.preview_token)
+            print(json.dumps(result, ensure_ascii=False))
+        except ValueError as exc: print(json.dumps({'ok': False, 'error': str(exc)}))
+        return
     if args.command == 'serve': run_server(); return
     if args.command == 'plugin-state':
         ui=state_for_ui()
@@ -1009,21 +1587,8 @@ def main():
         print(json.dumps(updater.fetch_github_update(installed_version=VERSION)));return
     if args.command == 'set-mode':
         if not args.mode: parser.error('--mode is required')
-        with LOCK:
-            cfg=config()
-            if args.appid:
-                target=next((g for g in installed_games() if g['appid']==args.appid),None)
-                if target is None:parser.error('Installed Steam game not found')
-                cfg['games'][args.appid]=args.mode
-                cfg['enabled']=True
-                atomic_json(CONFIG,cfg)
-                result=apply_profile(target,args.mode,force=True)
-                print(json.dumps({'ok':True,'game':target['name'],'mode':args.mode,'result':result}))
-            else:
-                cfg['default']=args.mode;cfg['enabled']=True
-                cfg['games']={}
-                atomic_json(CONFIG,cfg)
-                print(json.dumps({'ok':True,'default':args.mode}))
+        try: print(json.dumps(save_mode(args.mode, args.appid)))
+        except ValueError as exc: parser.error(str(exc))
         return
     if args.command == 'export':
         print('Saved local diagnostic ZIP:', save_diagnostic_zip()); return
@@ -1053,7 +1618,7 @@ def main():
         print('Game not found:', args.appid, file=sys.stderr); sys.exit(2)
     if args.command == 'apply':
         for g in selected:
-            print(g['name'], apply_profile(g, effective_mode(g['appid'])))
+            print(g['name'], approve_profile(g['appid'], effective_mode(g['appid']), args.preview_token))
     elif args.command == 'restore':
         for g in selected:
             print(g['name'], restore_game(g['appid']))
