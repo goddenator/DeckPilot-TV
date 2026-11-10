@@ -1,4 +1,4 @@
-# DeckPilot TV v0.8.1
+# DeckPilot TV v0.8.2
 
 Experimental Steam Deck OLED/docked-TV research and cautious settings tool. No paid API or subscription. Community evidence does not guarantee TV performance; the official Valve dock supports up to 4K60 or 1440p120 depending on connection, not guaranteed 4K120.
 
@@ -16,7 +16,7 @@ Game Checkup verifies matching local settings, manual changes and safe restore a
 
 ## Installation and updates
 
-For a reviewed/published release, extract `DeckPilot_TV_v0.8.1.zip` in Desktop Mode and run its `install.sh` once. The installer runs as your user and keeps existing preferences/backups. This development branch does not publish a release or provide an on-device verified binary.
+For a reviewed/published release, extract `DeckPilot_TV_v0.8.2.zip` in Desktop Mode and run its `install.sh` once. The installer runs as your user and keeps existing preferences/backups. This development branch does not publish a release or provide an on-device verified binary.
 
 After initial setup, use the existing trusted GitHub release feed for automatic checks/downloads and the Decky Settings update/rollback confirmation controls. Decky plugin updates remain a separate manual approval; they are never silently installed. The Desktop dashboard can connect/disconnect a trusted `owner/repo` feed. Installation requires explicit approval, a GitHub-issued SHA256 digest, a frozen archive with a digest rechecked at installation, strict ZIP/manifest validation and a successful restart check; rollback remains available. A missing release, blocked API or rate limit is reported separately. No routine manual Konsole commands are required after installation.
 
@@ -44,4 +44,4 @@ Existing FPS logs are off by default. Advanced can enable read-only summaries of
 
 Community report confidence describes specificity/recency of independent evidence for the selected display context, not guaranteed FPS. Retained verified identity/reports can be used offline for up to 30 days and are labelled cached/stale; stale evidence lowers confidence. No initial cache means an offline lookup fails clearly.
 
-Steam Play is untouched. No launch interception is registered; its requested approval flow is documented for a later hardware-tested experiment in the roadmap.
+Steam’s own Play remains untouched. A working opt-in **DeckPilot Play button** now implements cached advice, exact approval/backup/apply and an ordinary Steam launch request. See [the prototype guide](../docs/PLAY-PROTOTYPE.md). Native interception is not implemented.

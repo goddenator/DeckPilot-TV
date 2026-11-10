@@ -32,7 +32,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = '0.8.1'
+VERSION = '0.8.2'
 APP = 'deckpilot-tv'
 PORT = 38647
 MODES = {'graphics', 'performance', 'balanced'}
@@ -163,7 +163,9 @@ def config():
             # Retain legacy aliases so an app rollback can still read current preferences.
             'default': profiles[context]['default'], 'games': dict(profiles[context]['games']),
             'measurements_enabled': obj.get('measurements_enabled', shadow.get('measurements_enabled', False) if recovering else False) is True,
-            'launch_prompts': False,  # no launch hook is registered; fail-open by construction
+            'launch_prompts': False,  # native Steam Play remains completely unhooked
+            'play_assistant_enabled': obj.get('play_assistant_enabled', shadow.get('play_assistant_enabled', False) if recovering else False) is True,
+            'launch_dismissed': [k for k in obj.get('launch_dismissed', shadow.get('launch_dismissed', []) if recovering else []) if isinstance(k,str) and k.isascii() and k.isdigit() and len(k)<=10 and 0 < int(k) <= 4294967295] if isinstance(obj.get('launch_dismissed', shadow.get('launch_dismissed', []) if recovering else []), list) else [],
             'approved_files': {str(k): [p for p in paths if isinstance(p, str)][:40] for k, paths in obj.get('approved_files', {}).items() if isinstance(paths, list)} if isinstance(obj.get('approved_files'), dict) else {},
             'approved_context': {k: v for k, v in approved_context.items() if isinstance(v, str) and v in CONTEXTS} if isinstance(approved_context, dict) else {},
             'approved': clean_modes(obj.get('approved'))}
@@ -180,7 +182,8 @@ def write_config(cfg):
     active = cfg['profiles'][cfg['context']]
     cfg['default'], cfg['games'] = active['default'], dict(active['games'])
     # Keep inactive choices recoverable when a rollback writes the legacy schema.
-    atomic_json(BASE/'profiles-v2.json', {'context':cfg['context'], 'profiles':cfg['profiles'], 'measurements_enabled':cfg['measurements_enabled']})
+    atomic_json(BASE/'profiles-v2.json', {'context':cfg['context'], 'profiles':cfg['profiles'], 'measurements_enabled':cfg['measurements_enabled'],
+                                         'play_assistant_enabled':cfg['play_assistant_enabled'], 'launch_dismissed':cfg['launch_dismissed']})
     atomic_json(CONFIG, cfg)
 
 
@@ -208,7 +211,7 @@ from html.parser import HTMLParser
 from urllib.robotparser import RobotFileParser
 from concurrent.futures import ThreadPoolExecutor, wait
 
-RESEARCH_AGENT = 'DeckPilot/0.8.1 (+public game-settings research)'
+RESEARCH_AGENT = 'DeckPilot/0.8.2 (+public game-settings research)'
 RESEARCH_HOSTS = {'store.steampowered.com', 'deckverified.games',
                   'www.sharedeck.games', 'sharedeck.games', 'steamdeckhq.com', 'github.com'}
 RESEARCH_LIMIT = 1024 * 1024
@@ -764,7 +767,7 @@ def preview_profile(appid, mode, context=None):
                     return {n.get('name'): n.text for n in ET.fromstring(text).findall('pref')
                             if n.get('name') in ('Screenmanager Resolution Width', 'Screenmanager Resolution Height')}
                 before, after = values(raw), values(changed)
-            files.append({'file': path.name, 'adapter': adapter, 'manual_changes': manual,
+            files.append({'file': path.name, 'location': str(path), 'adapter': adapter, 'manual_changes': manual,
                           'changes': [{'key': k, 'before': before.get(k), 'after': v} for k, v in after.items() if before.get(k) != v]})
         except (OSError, ValueError, UnicodeError):
             return {'ok': False, 'status': 'unreadable', 'files': [], 'error': 'A supported config cannot be safely read. No changes approved.'}
@@ -866,6 +869,94 @@ def evidence_summary(reports, context):
     return {'mode': 'balanced', 'confidence': confidence, 'reason': reason,
             'context': context, 'matching_reports': len(matching),
             'note': 'Balanced is a conservative starting point. Confidence describes matching evidence, not guaranteed performance.'}
+
+
+
+# Controlled Play is opt-in. These functions never invoke Steam or a network client.
+@game_transaction
+def set_play_assistant(enabled):
+    if not isinstance(enabled, bool): raise ValueError('Expected on/off.')
+    cfg = config(); cfg['play_assistant_enabled'] = enabled; write_config(cfg)
+    return {'ok': True, 'message': 'DeckPilot Play recommendations '+('enabled.' if enabled else 'disabled.')}
+
+
+@game_transaction
+def dismiss_play_advice(appid, dismissed):
+    appid = steam_id(appid)
+    if not isinstance(dismissed, bool): raise ValueError('Expected on/off.')
+    cfg = config(); ids = set(cfg['launch_dismissed'])
+    if dismissed: ids.add(appid)
+    else: ids.discard(appid)
+    cfg['launch_dismissed'] = sorted(ids); write_config(cfg)
+    return {'ok': True, 'message': 'Advice hidden for this game.' if dismissed else 'Advice enabled for this game.'}
+
+
+def cached_launch_advice(appid, context):
+    """Read existing exact-ID cache only. No loader, refresh, or Internet request."""
+    cache = read_json(BASE/'research-cache.json', {})
+    if not isinstance(cache, dict): cache = {}
+    reports = []
+    sources = ('Deck Settings / deckverified.games', 'ShareDeck', 'SteamDeckHQ')
+    for source in sources:
+        item = cache.get(source+':'+appid, {})
+        if not isinstance(item, dict) or not isinstance(item.get('at'), (int,float)): continue
+        age = time.time()-item['at']; value = item.get('value')
+        if not 0 <= age <= 30*86400 or not isinstance(value, dict) or value.get('status') != 'ok': continue
+        raw_reports = value.get('reports', [])
+        if not isinstance(raw_reports, list): continue
+        for report in raw_reports[:20]:
+            if not isinstance(report, dict) or report.get('appid') != appid or report.get('source') != source: continue
+            if not isinstance(report.get('url'), str) or not public_url(report['url']): continue
+            # Bound data exposed by this fast path, even if a local cache was malformed.
+            text_fields = ('device','display_context','resolution','fps','fps_kind','game_version','report_date')
+            normalized = {key: clean_text(report.get(key), 100) or None for key in text_fields}
+            normalized['device'] = normalized['device'] or 'unknown'
+            normalized['display_context'] = normalized['display_context'] or 'unknown'
+            normalized.update(source=source, appid=appid, stale=age>=RESEARCH_TTL)
+            reports.append(normalized)
+    evidence = evidence_summary(reports, context)
+    matching = [r for r in reports if r.get('display_context') == context]
+    return {'recommendation': evidence, 'report_count': len(reports),
+            'sources': sorted({r['source'] for r in reports}),
+            'latest_report': max((r.get('report_date') or '' for r in reports), default='') or None,
+            'stale': any(r['stale'] for r in reports),
+            # Metadata is evidence, not instructions or measured DeckPilot performance.
+            'display_match': bool(matching),
+            'resolution': matching[0].get('resolution') if matching else None,
+            'fps': matching[0].get('fps') if matching else None,
+            'fps_kind': matching[0].get('fps_kind') if matching else None}
+
+
+def prepare_play(appid, context=None):
+    appid = steam_id(appid); cfg = config(); context = profile_context(context, cfg)
+    if not cfg['play_assistant_enabled']: return {'ok': True, 'status': 'disabled', 'appid': appid}
+    if context != cfg['context']: return {'ok': False, 'status': 'profile-changed', 'error': 'Profile changed. Open the game again.'}
+    game = next((g for g in installed_games() if g['appid'] == appid), None)
+    if game is None: return {'ok': False, 'status': 'not-installed', 'error': 'This game is not installed.'}
+    if game_is_running(appid): return {'ok': False, 'status': 'running', 'error': 'Already running. Use Steam to resume.'}
+    if appid in cfg['launch_dismissed']: return {'ok': True, 'status': 'dismissed', 'appid': appid}
+    checkup = game_checkup(appid, context)
+    return {'ok': True, 'status': 'prompt', 'appid': appid, 'name': game['name'], 'context': context,
+            'saved_mode': effective_mode(appid, cfg, context),
+            'can_apply': checkup['status'] in ('needs-review','ready','settings-match'),
+            **cached_launch_advice(appid, context)}
+
+
+@game_transaction
+def play_preview(appid, mode, context=None):
+    appid = steam_id(appid); cfg = config(); context = profile_context(context, cfg)
+    if not cfg['play_assistant_enabled'] or appid in cfg['launch_dismissed']:
+        return {'ok': False, 'error': 'Recommendations disabled. Play without changes.'}
+    if cfg['context'] != context: return {'ok': False, 'error': 'Profile changed. Preview again.'}
+    return preview_profile(appid, mode, context)
+
+
+@game_transaction
+def play_approve(appid, mode, token, context=None):
+    appid = steam_id(appid); cfg = config()
+    if not cfg['play_assistant_enabled'] or appid in cfg['launch_dismissed']:
+        return {'ok': False, 'error': 'Recommendations disabled. No settings applied.'}
+    return approve_profile(appid, mode, token, context)
 
 
 
@@ -1579,7 +1670,7 @@ def state_for_ui():
                        'supported': has_adapter, 'metrics': metrics, 'hint': mode_hint(mode, metrics)})
     return {'version': VERSION, 'schema_version': 2, 'context': cfg['context'], 'profiles': cfg['profiles'],
             'measurements_enabled': cfg['measurements_enabled'],
-            'launch_prompt': {'enabled': False, 'available': False, 'reason': 'No safe launch gate has been hardware-validated. Steam Play is untouched.'},
+            'launch_prompt': {'protocol': 1, 'enabled': cfg['play_assistant_enabled'], 'available': True, 'native_play': False, 'method': 'deckpilot-button', 'dismissed': cfg['launch_dismissed'], 'reason': 'Opt-in DeckPilot Play button only. Native Steam Play is untouched.'},
             'enabled': cfg['enabled'], 'default': cfg['default'], 'games': result, 'count': len(result),
             'supported': sum(1 for g in result if g['supported']),
             'vrr_capability': external_vrr_capability(), 'display': display_diagnostics(), 'saved_games': cfg['games'], 'cloud': cloud_status()}
@@ -1785,12 +1876,22 @@ def run_server():
 
 def main():
     parser = argparse.ArgumentParser(description='DeckPilot TV: Steam Deck OLED docked game optimiser')
-    parser.add_argument('command', choices=['serve', 'scan', 'apply', 'restore', 'status', 'diagnose', 'export', 'cloud-status', 'cloud-upload', 'cloud-enable', 'cloud-disable', 'update-status', 'set-mode', 'plugin-state', 'check-github', 'install-update', 'rollback-update', 'search', 'research', 'preview', 'approve', 'set-context', 'checkup', 'measurements-enable', 'measurements-disable'])
+    parser.add_argument('command', choices=['serve', 'scan', 'apply', 'restore', 'status', 'diagnose', 'export', 'cloud-status', 'cloud-upload', 'cloud-enable', 'cloud-disable', 'update-status', 'set-mode', 'plugin-state', 'check-github', 'install-update', 'rollback-update', 'search', 'research', 'preview', 'approve', 'set-context', 'checkup', 'measurements-enable', 'measurements-disable', 'play-enable', 'play-disable', 'play-plan', 'play-preview', 'play-approve', 'play-dismiss', 'play-reset'])
     parser.add_argument('appid', nargs='?')
     parser.add_argument('--mode', choices=sorted(MODES))
     parser.add_argument('--preview-token', default='')
     parser.add_argument('--context', choices=sorted(CONTEXTS))
     args = parser.parse_args()
+    if args.command in ('play-enable','play-disable','play-plan','play-preview','play-approve','play-dismiss','play-reset'):
+        try:
+            if args.command in ('play-enable','play-disable'): result = set_play_assistant(args.command=='play-enable')
+            elif args.command == 'play-plan': result = prepare_play(args.appid, args.context)
+            elif args.command == 'play-preview': result = play_preview(args.appid, args.mode, args.context)
+            elif args.command == 'play-approve': result = play_approve(args.appid, args.mode, args.preview_token, args.context)
+            else: result = dismiss_play_advice(args.appid, args.command=='play-dismiss')
+            print(json.dumps(result, ensure_ascii=False))
+        except ValueError as exc: print(json.dumps({'ok':False,'error':str(exc)}))
+        return
     if args.command in ('set-context', 'checkup', 'measurements-enable', 'measurements-disable'):
         try:
             if args.command == 'set-context': result = set_context(args.context)

@@ -71,6 +71,18 @@ class Plugin:
     async def cloud_action(self, action: str):
         if action not in ('enable', 'disable', 'upload'): return {'ok': False, 'error': 'Unknown diagnostics action'}
         return await self._run('cloud-'+action)
+    async def set_play_assistant(self, enabled: bool):
+        if not isinstance(enabled, bool): return {'ok':False,'error':'Expected on/off'}
+        return await self._run('play-enable' if enabled else 'play-disable')
+    async def play_plan(self, appid: str, context: str):
+        return await self._run('play-plan', str(appid), '--context', context)
+    async def play_preview(self, appid: str, mode: str, context: str):
+        return await self._run('play-preview', str(appid), '--mode', mode, '--context', context)
+    async def play_approve(self, appid: str, mode: str, token: str, context: str):
+        return await self._run('play-approve', str(appid), '--mode', mode, '--preview-token', token, '--context', context)
+    async def dismiss_play_advice(self, appid: str, dismissed: bool):
+        if not isinstance(dismissed, bool): return {'ok':False,'error':'Expected on/off'}
+        return await self._run('play-dismiss' if dismissed else 'play-reset', str(appid))
     async def check_github(self): return await self._run('check-github')
     async def install_update(self): return await self._run('install-update')
     async def rollback_update(self): return await self._run('rollback-update')

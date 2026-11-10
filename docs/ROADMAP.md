@@ -1,6 +1,6 @@
 # DeckPilot development roadmap
 
-This branch is an unreleased v0.8.1 development build for PR #3 and the redesign feedback in issue #4. No release or hardware readiness is implied.
+This branch is an unreleased v0.8.2 development build for PR #3 and the redesign feedback in issue #4. No release or hardware readiness is implied.
 
 ## Shipped in this development branch
 
@@ -15,7 +15,7 @@ This branch is an unreleased v0.8.1 development build for PR #3 and the redesign
 
 ## Next: experimental Play-time recommendations
 
-**Not implemented or registered in this build.** Advanced shows Off / unavailable. Even if a stale config contains an enabled flag, the backend reports disabled. Ordinary Steam Play is completely untouched.
+**Update:** the [v0.8.2 controlled Play prototype](PLAY-PROTOTYPE.md) is implemented and opt-in, using DeckPilot’s own Play button. Native Steam Play interception remains unimplemented and unregistered. The following native-hook investigation and later acceptance gates remain relevant.
 
 ### Investigation
 
@@ -47,7 +47,7 @@ The lower-risk first experiment is an **opt-in DeckPilot-controlled Play button*
 
 1. Preserve a backup of the installed app/plugin before testing this unreleased build. Install app and plugin together so the new plugin sees backend schema 2. An older app shows an update message and profile controls stay disabled.
 2. In Gaming Mode at 800p, use only D-pad/joystick and A/B through Home → Find Games → Game Details → Settings → Advanced. Confirm focus stays on the selected mode after saving, virtual keyboard works, long names/empty search/errors scroll/read correctly, and Back is predictable. Repeat docked on the TV.
-3. Confirm ordinary Steam Play is unchanged with the plugin loaded, unavailable, reloaded and offline. No prompt, cancellation, global hook or background launch should occur in this build.
+3. Confirm ordinary Steam Play is unchanged with the plugin loaded, unavailable, reloaded and offline. No native Steam interception, cancellation, global hook or background launch should occur. The new prompt appears only after an opted-in DeckPilot Play press; use the prototype guide for those checks.
 4. Save different Docked/Handheld defaults and per-game modes for installed and uninstalled games. Switch profiles: no file should change. Preview, cancel, then separately approve while closed. Start a game during preview/apply: it must not be edited while detected running.
 5. Test one compatible Unreal config and each native Unity XML adapter. Check unrelated keys and game saves remain untouched. Make a manual change; Checkup must protect it. Restore an unchanged managed file and verify later sync does not reapply. Missing backups must not report Ready.
 6. Read live source reports, compare exact App IDs, dates and display context. Disconnect Internet after caching: retained reports must say offline/cached and confidence must downgrade for stale data. A first-time offline lookup must clearly fail without blocking preferences.

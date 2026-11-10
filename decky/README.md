@@ -1,4 +1,4 @@
-# DeckPilot Decky — v0.8.1 development
+# DeckPilot Decky — v0.8.2 development
 
 Install the reviewed app and plugin together. This development plugin expects backend schema 2; an older app shows an update message and the new profile controls stay disabled.
 
@@ -8,7 +8,7 @@ Find installed/saved games or search all available Steam Store games by name/App
 
 Settings selects Docked/Handheld manually. Changing the selection does not change game files; review and approve for that context. Advanced holds restore confirmation, optional existing FPS/frame-time logs, private diagnostic export/Drive controls and technical status. App updates and rollback require confirmation; the plugin update button only opens the trusted releases page. No plugin installer runs silently.
 
-Play-time recommendations show **Off / unavailable**. No launch callback, cancellation, relaunch or Steam Play patch is registered in this build. See [investigation, later roadmap and device checklist](../docs/ROADMAP.md).
+Play-time recommendations are now a working **opt-in controlled Play button** (default Off). Enable in Advanced, then open an installed game and choose Play with DeckPilot. Cached advice precedes Apply & Play / Play Without Changes / Don’t Ask Again. The apply path shows all exact changes and requires approval before backup/apply/launch. Native Steam Play is **not** hooked or cancelled. See [the prototype guide](../docs/PLAY-PROTOTYPE.md). Actual launch behavior still needs Steam Deck testing.
 
 The Python bridge still runs every app subprocess as the actual deck UID/GID/groups, with the deck home/runtime directory and user D-Bus session. Untrusted online text never reaches a shell or a local adapter.
 

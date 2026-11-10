@@ -1,5 +1,7 @@
 import { ButtonItem, PanelSection, PanelSectionRow, TextField, Navigation } from '@decky/ui';
 import { useEffect, useRef, useState } from 'react';
+import { launchController } from './launch';
+import { LaunchView } from './LaunchView';
 import type { ReactNode } from 'react';
 import { api, Checkup, Game, Mode, Preview, Profile, Research, Result, State } from './api';
 
@@ -15,10 +17,18 @@ const statusLabels:Record<string,string> = {ready:'Ready',running:'Game running'
 const labelFor=(mode?:Mode)=>MODES.find(([m])=>m===mode)?.[1]||'Balanced';
 
 export function DeckPilotApp(){
-  const [screen,setScreen]=useState<Screen>('home');
+  const [launchState,setLaunchState]=useState(launchController.getSnapshot);
+  const launchActive=launchState.phase!=='idle';
+  const launchLocked=launchState.phase==='applying'||launchState.phase==='launching';
+  useEffect(()=>{
+    const update=()=>setLaunchState(launchController.getSnapshot());
+    const unsubscribe=launchController.subscribe(update);update();
+    return()=>{unsubscribe();launchController.cancel();};
+  },[]);
+  const [screen,setScreen]=useState<Screen>(launchActive?'game':'home');
   const [detail,setDetail]=useState<Detail>('main');
   const [info,setInfo]=useState<State>({});
-  const [selected,setSelected]=useState<Game>();
+  const [selected,setSelected]=useState<Game|undefined>(launchState.target?{appid:launchState.target.appid,name:launchState.target.name}:undefined);
   const [checkup,setCheckup]=useState<Checkup>();
   const [research,setResearch]=useState<Research>();
   const [review,setReview]=useState<{preview:Preview;mode:Mode;context:Profile;appid:string}>();
@@ -29,7 +39,7 @@ export function DeckPilotApp(){
   const [busy,setBusy]=useState(false);
   const [message,setMessage]=useState('');
   const [offline,setOffline]=useState(false);
-  const [confirm,setConfirm]=useState<'install'|'rollback'|'drive'|undefined>();
+  const [confirm,setConfirm]=useState<'install'|'rollback'|'drive'|'play'|undefined>();
   const [technical,setTechnical]=useState(false);
   const inFlight=useRef(false);
   const context=info.context||'docked';
@@ -62,7 +72,7 @@ export function DeckPilotApp(){
       });
     }
   };
-  const navigate=(next:Screen)=>{setScreen(next);setDetail('main');setReview(undefined);setConfirm(undefined);setTechnical(false);setMessage('');};
+  const navigate=(next:Screen)=>{if(!launchController.cancel())return;setScreen(next);setDetail('main');setReview(undefined);setConfirm(undefined);setTechnical(false);setMessage('');};
   const selectGame=(g:Game)=>{
     setSelected(g);setResearch(undefined);setReview(undefined);setCheckup(undefined);navigate('game');
     void run(async()=>{const c=await api.checkup(g.appid,context);setCheckup(c);return c;});
@@ -76,6 +86,7 @@ export function DeckPilotApp(){
   const bigButton=(text:string,onClick:()=>void,description?:string,disabled=false,key?:string)=>row(<ButtonItem layout="below" childrenContainerWidth="max" disabled={busy||disabled} onClick={onClick} description={description}>{text}</ButtonItem>,key||text.replace(/^✓ /,'').split(' · ')[0]);
   const modeButtons=()=>MODES.map(([m,title,description])=>bigButton((mode===m?'✓ ':'')+title,()=>chooseMode(m),description,!modern||offline));
   const back=()=>{
+    if(launchActive){if(launchController.cancel())setMessage('Play cancelled.');return;}
     if(screen==='game'&&detail!=='main'){setDetail('main');setReview(undefined);setTechnical(false);}
     else navigate(screen==='advanced'?'settings':'home');
   };
@@ -94,7 +105,7 @@ export function DeckPilotApp(){
   return <div className="deckpilot-app" style={{paddingBottom:16}}>
     <style>{`.deckpilot-app button,.deckpilot-app [role="button"]{min-height:52px}.deckpilot-app p{margin:8px 0;line-height:1.4}.deckpilot-app .dp-card{padding:12px;border-radius:10px;background:rgba(255,255,255,.06)}.deckpilot-app .dp-small{font-size:12px;opacity:.8}.deckpilot-app h2{font-size:20px;margin:6px 0}.deckpilot-app button:focus-visible{outline:3px solid #67dfce;outline-offset:2px}`}</style>
     <PanelSection title={title}>
-      {screen!=='home'&&bigButton('Back',back)}
+      {screen!=='home'&&bigButton('Back',back,undefined,launchLocked)}
       {row(<div className="dp-small">{context==='docked'?'Docked':'Handheld'} profile</div>)}
       {offline&&row(<div role="alert">App connection unavailable.</div>)}
       {!modern&&row(<div className="dp-small">Update the app for the new profile controls.</div>)}
@@ -120,13 +131,16 @@ export function DeckPilotApp(){
       {currentPage<maxPage&&bigButton('More games',()=>setPage(currentPage+1))}
     </PanelSection>}
 
-    {screen==='game'&&game&&detail==='main'&&<>
+    {screen==='game'&&game&&launchActive&&<LaunchView state={launchState} controller={launchController} onDone={()=>{if(launchController.cancel()){setMessage('');void run(refreshGame);}}}/>}
+
+    {screen==='game'&&game&&!launchActive&&detail==='main'&&<>
       <PanelSection title="Game Checkup">
         {row(<div className="dp-card"><b>{checkup?.error?'Checkup unavailable':statusLabels[checkup?.status||'']||'Checking…'}</b><p>{checkup?.error||checkup?.message}</p>{Boolean(checkup?.backups)&&<div className="dp-small">Backups kept · {checkup?.can_restore?'Restore available':'Newer changes stay protected'}</div>}</div>)}
         {checkup?.error&&bigButton('Retry checkup',()=>void run(refreshGame))}
       </PanelSection>
       <PanelSection title="Your choice">{modeButtons()}</PanelSection>
       <PanelSection>
+        {info.launch_prompt?.enabled&&info.launch_prompt.protocol===1&&info.games?.some(g=>g.appid===game.appid)&&bigButton('Play with DeckPilot',()=>void launchController.start({appid:game.appid,name:game.name,context,installed:true,enabled:true}),'Opt-in cached advice before launching.',checkup?.status==='running')}
         {bigButton('Review & Apply',()=>void run(async()=>{
           const p=await api.preview(game.appid,mode,context);
           if(p.status==='preview'&&p.token&&!p.error){setReview({preview:p,mode,context,appid:game.appid});setDetail('review');}
@@ -188,8 +202,15 @@ export function DeckPilotApp(){
         {bigButton('Refresh Game Checkup',()=>void run(refreshGame))}
       </PanelSection>}
       <PanelSection title="Play-time recommendations">
-        {row(<p>Off · Not available yet. Steam Play is untouched.</p>)}
-        {row(<p className="dp-small">A safe approval prompt needs hardware testing. No launch interception is registered.</p>)}
+        {info.launch_prompt?.protocol===1?<>
+          {confirm==='play'?<>
+            {row(<p>Enable the experimental DeckPilot Play button? It uses cached advice. Steam’s own Play button stays unchanged. Hardware launch behavior still needs testing.</p>)}
+            {bigButton('Enable Play recommendations',()=>void run(async()=>{setConfirm(undefined);return api.playAssistant(true);}))}
+            {bigButton('Cancel',()=>setConfirm(undefined))}
+          </>:bigButton('Play recommendations · '+(info.launch_prompt.enabled?'On':'Off'),()=>info.launch_prompt?.enabled?void run(()=>api.playAssistant(false)):setConfirm('play'))}
+          {row(<p className="dp-small">DeckPilot’s Play button only. Native Steam Play is not intercepted.</p>)}
+          {game&&info.launch_prompt.dismissed?.includes(game.appid)&&bigButton('Ask again for this game',()=>void run(()=>api.dismissPlay(game.appid,false)))}
+        </>:row(<p>Off · Update the app for the opt-in DeckPilot Play prototype. Steam Play is untouched.</p>)}
       </PanelSection>
       <PanelSection title="Optional measurements">
         {bigButton('Existing FPS logs · '+(info.measurements_enabled?'On':'Off'),()=>void run(()=>api.measurements(!info.measurements_enabled)),undefined,!modern||offline)}
@@ -208,10 +229,10 @@ export function DeckPilotApp(){
       </PanelSection>
       <PanelSection title="Display & App">
         {row(<p className="dp-small">VRR capability: {info.display?.vrr_capability||'unknown'}. VRR enabled: {info.display?.vrr_enabled||'unknown'}. {info.display?.note}</p>)}
-        {row(<p className="dp-small">App {info.version||'unknown'} · Plugin 0.8.1. {info.update?.github?.message}</p>)}
+        {row(<p className="dp-small">App {info.version||'unknown'} · Plugin 0.8.2. {info.update?.github?.message}</p>)}
         {bigButton('Refresh status',()=>void run(async()=>{await refresh();return {message:'Refreshed.'};}))}
       </PanelSection>
     </>}
-    {(busy||message)&&<PanelSection>{row(<div role="status" aria-live="polite">{busy?'Working…':message}</div>)}</PanelSection>}
+    {!launchActive&&(busy||message)&&<PanelSection>{row(<div role="status" aria-live="polite">{busy?'Working…':message}</div>)}</PanelSection>}
   </div>;
 }

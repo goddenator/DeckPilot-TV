@@ -113,7 +113,7 @@ test('updates, diagnostics, and measurement opt-in stay in Settings/Advanced',as
  await button(page,'Review app update · v0.8.2').click();expect(calls.filter(c=>c.name==='install_update')).toHaveLength(0);
  await button(page,'Cancel').click();await button(page,'Decky plugin updates').click();
  expect(calls.filter(c=>/install/.test(c.name))).toHaveLength(0);
- await button(page,'Advanced').click();await expect(page.getByText('Off · Not available yet. Steam Play is untouched.')).toBeVisible();
+ await button(page,'Advanced').click();await expect(page.getByText('Off · Update the app for the opt-in DeckPilot Play prototype. Steam Play is untouched.')).toBeVisible();
  await button(page,'Existing FPS logs · Off').click();await expect(button(page,'Existing FPS logs · On')).toBeVisible();
  await page.getByRole('button',{name:/Set up Drive uploads/}).click();expect(calls.filter(c=>c.name==='cloud_action')).toHaveLength(0);
  await button(page,'Enable Drive uploads').click();expect(calls.find(c=>c.name==='cloud_action')?.args).toEqual(['enable']);
