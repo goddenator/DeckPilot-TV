@@ -15,6 +15,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Test publication approval and permission contracts
+        run: node --test .github/scripts/publication-guard.test.cjs
       - name: Test Python app
         run: |
           cd app
@@ -44,3 +46,37 @@ jobs:
         with:
           name: deckpilot-build
           path: out/*
+  publication-permissions-preflight:
+    # Same-repository PRs retain explicitly requested write permissions. Never run
+    # this job for forks and never check out or execute PR code with this token.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      actions: read
+    steps:
+      - name: Read-only publishing permission and environment preflight
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (context.repo.owner !== 'goddenator' || context.repo.repo !== 'DeckPilot-TV') throw Error('Unexpected repository');
+            const pr = (await github.rest.pulls.get({...context.repo, pull_number:context.issue.number})).data;
+            if (pr.head.repo.full_name !== 'goddenator/DeckPilot-TV' || pr.base.ref !== 'main' || pr.head.sha !== context.payload.pull_request.head.sha) throw Error('PR changed; rerun for the latest head');
+            await core.summary.addHeading('Non-publishing Preview preflight').addRaw(`Same-repository PR #${pr.number}; exact unmerged head ${pr.head.sha}. This job requests contents:write, pull-requests:read and actions:read, matching the protected publisher. No tag, draft, release or deployment is created.\n`).write();
+            let env;
+            try {
+              env = (await github.rest.repos.getEnvironment({...context.repo, environment_name:'deckpilot-preview-publish'})).data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              core.warning('Publication BLOCKED: deckpilot-preview-publish does not exist or is not visible. Configure the owner-required-reviewer environment before protected preflight/publication.');
+              await core.summary.addRaw('\nPublication readiness: BLOCKED — Preview environment unavailable. The owner approval barrier has not been exercised.\n').write();
+              return;
+            }
+            const ownerRequired = env.protection_rules?.some(r => r.type === 'required_reviewers' && r.reviewers?.length === 1 && r.reviewers[0].type === 'User' && r.reviewers[0].reviewer?.login === 'goddenator');
+            if (!ownerRequired) {
+              core.warning('Publication BLOCKED: goddenator must be the sole required Preview environment reviewer.');
+              await core.summary.addRaw('\nPublication readiness: BLOCKED — missing required owner reviewer.\n').write();
+              return;
+            }
+            await core.summary.addRaw('\nPR/environment read APIs succeeded and the owner is the sole required reviewer. To exercise the actual approval gate without publishing, use deckpilot:preflight-preview. That protected run repeats validation and runs the real CLI preflight with no mutation commands.\n').write();
