@@ -60,11 +60,33 @@ def smoke():
                         page.get_by_role('button',name='Research',exact=True).click()
                         page.locator('#research-results').get_by_text('ShareDeck: unavailable').wait_for()
                         assert page.locator('#research-results img').count()==0
+                        update_calls=[]
+                        local_link='http://127.0.0.1:45678/'+'a'*43+'/DeckPilot.zip'
+                        def update_route(route):
+                            if route.request.method=='GET':
+                                route.fulfill(json={'available':True,'version':'0.8.3-preview.1','can_undo':True,'status':'Verified preview','suite':{'token':'captured-approval','version':'0.8.3-preview.1','channel':'preview','plugin_rollback':True,'app_installed':'0.8.2'}})
+                            else:
+                                body=route.request.post_data_json;update_calls.append(body)
+                                route.fulfill(json={'url':local_link} if body['action']=='plugin-rollback' else {'message':'App update started.'})
+                        page.route('**/api/update',update_route)
+                        page.evaluate('checkUpdate()')
+                        page.get_by_role('button',name='Install App 0.8.3-preview.1',exact=True).wait_for()
+                        page.once('dialog',lambda dialog:dialog.dismiss())
+                        page.get_by_role('button',name='Install App 0.8.3-preview.1',exact=True).click()
+                        assert not update_calls
+                        page.once('dialog',lambda dialog:dialog.accept())
+                        page.get_by_role('button',name='Install App 0.8.3-preview.1',exact=True).click()
+                        page.wait_for_function("document.getElementById('update-status').textContent==='App update started.'")
+                        assert update_calls[0]=={'action':'install','token':'captured-approval','allow_downgrade':False}
+                        page.once('dialog',lambda dialog:dialog.accept())
+                        page.get_by_role('button',name='Prepare Plugin Rollback',exact=True).click()
+                        page.get_by_role('textbox',name='Plugin rollback link').wait_for()
+                        assert page.get_by_role('textbox',name='Plugin rollback link').input_value()==local_link
                         assert not errors,errors
                     finally:browser.close()
             finally:
                 server.shutdown();server.server_close()
-    print('Browser smoke passed: isolated dashboard, preferences, search, source failures, escaped hostile text; no JavaScript errors.')
+    print('Browser smoke passed: isolated dashboard, preferences, search, source failures, escaped hostile text, captured update approval and plugin rollback link; no JavaScript errors.')
 
 
 if __name__=='__main__':smoke()

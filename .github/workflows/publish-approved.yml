@@ -1,0 +1,77 @@
+name: Publish owner-approved update
+on:
+  pull_request:
+    types: [labeled]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Exact reviewed 40-character commit SHA
+        required: true
+      channel:
+        type: choice
+        options: [preview, stable]
+        default: preview
+permissions:
+  contents: read
+jobs:
+  guard:
+    if: github.event_name == 'workflow_dispatch' || (github.event.label.name == 'deckpilot:publish-preview' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.guard.outputs.sha }}
+      channel: ${{ steps.guard.outputs.channel }}
+    steps:
+      - uses: actions/github-script@v7
+        id: guard
+        with:
+          script: |
+            const channel = context.eventName === 'pull_request' ? 'preview' : context.payload.inputs.channel;
+            const sha = context.eventName === 'pull_request' ? context.payload.pull_request.head.sha : context.payload.inputs.commit;
+            if (!/^[a-f0-9]{40}$/.test(sha) || !['stable','preview'].includes(channel)) throw Error('Exact reviewed SHA and channel required');
+            if (context.repo.owner !== 'goddenator' || context.repo.repo !== 'DeckPilot-TV') throw Error('Unexpected repository');
+            const env = await github.rest.repos.getEnvironment({...context.repo, environment_name:'deckpilot-'+channel+'-publish'});
+            const ownerReview = env.data.protection_rules.some(r => r.type === 'required_reviewers' && r.reviewers.some(v => v.type === 'User' && v.reviewer.login === 'goddenator'));
+            if (!ownerReview) throw Error('Configure goddenator as required environment reviewer before publication');
+            core.setOutput('sha',sha); core.setOutput('channel',channel);
+  publish:
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: deckpilot-${{ needs.guard.outputs.channel }}-publish
+    permissions:
+      contents: write
+    concurrency: deckpilot-publish
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Revalidate current PR head after owner approval
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          APPROVED_SHA: ${{ needs.guard.outputs.sha }}
+        with:
+          script: |
+            const pr=await github.rest.pulls.get({...context.repo,pull_number:context.issue.number});
+            if(pr.data.head.sha!==process.env.APPROVED_SHA || pr.data.state!=='open') throw Error('PR moved or closed. Approve the new commit separately.');
+      - name: Verify reviewed build
+        run: |
+          python3 -m unittest discover -s app -v
+          npm --prefix decky ci
+          npm --prefix decky run typecheck
+          npm --prefix decky run build
+          cd decky
+          npx playwright install --with-deps chromium
+          npm run test:ui
+      - name: Package paired components
+        run: python3 tools/package_release.py
+      - name: Publish verified immutable pair
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVED_SHA: ${{ needs.guard.outputs.sha }}
+          APPROVED_CHANNEL: ${{ needs.guard.outputs.channel }}
+        run: python3 tools/publish_approved.py

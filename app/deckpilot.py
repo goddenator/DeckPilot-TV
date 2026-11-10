@@ -6,6 +6,7 @@ prefixes and native Valheim resolution preferences after preview approval. Does 
 """
 from __future__ import annotations
 import argparse
+import updater
 import csv
 from functools import lru_cache
 from io import BytesIO
@@ -32,7 +33,8 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = '0.8.2'
+VERSION = '0.8.3'
+BUILD_ID = '0.8.3-preview.1'
 APP = 'deckpilot-tv'
 PORT = 38647
 MODES = {'graphics', 'performance', 'balanced'}
@@ -1393,7 +1395,7 @@ def diagnostic_report():
     except OSError:
         os_name = 'Linux'
     return {
-        'format': 1, 'app': 'DeckPilot TV', 'version': VERSION,
+        'format': 1, 'app': 'DeckPilot TV', 'version': VERSION, 'build_id': BUILD_ID,
         'created_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
         'operating_system': os_name[:120], 'kernel': platform.release()[:120],
         'python_version': platform.python_version(),
@@ -1599,60 +1601,27 @@ def mode_hint(mode, metrics):
 
 
 def update_state():
-    """Read a staged Github release or local ZIP. Never install automatically."""
+    """Trusted Stable/Preview suite only. No manual Downloads or arbitrary feed."""
     import updater
     try:
-        candidate = updater.candidate_for_install(VERSION)
-        result = read_json(BASE / 'updates' / 'result.json', {})
-        if not isinstance(result, dict): result = {}
-        github = updater.remote_status()
-        return {'available': bool(candidate),
-                'version': candidate['version'] if candidate else None,
-                'archive': candidate['path'].name if candidate else None,
-                'status': str(result.get('message', 'No updates installed yet.'))[:220],
-                'result': str(result.get('status', 'idle'))[:30],
-                'can_undo': (BASE/'updates'/'previous-app'/'deckpilot.py').is_file(),
-                'github': {'repository':updater.release_source(),
-                           'status':github.get('status','disabled'),
-                           'message':github.get('message','Connect a GitHub repository to enable automatic downloads.'),
-                           'version':github.get('version'),
-                           'checked_at':github.get('checked_at')}}
-    except Exception:
-        return {'available':False,'version':None,'archive':None,
-                'status':'Update check failed.','result':'error','can_undo':False,
-                'github':{'repository':'','status':'error','message':'Update status unavailable.'}}
+        suite=updater.suite_status()
+        return {'suite':suite,'available':suite.get('app_needed',False),'version':suite.get('version'),
+                'can_undo':suite.get('app_rollback',False),'status':suite['message'],
+                'github':{'repository':updater.TRUSTED_REPOSITORY,'message':suite['message'],'status':suite['status']}}
+    except Exception:return {'available':False,'status':'Update status unavailable.'}
 
 
-def start_local_update(action='install'):
-    """Run updater separately so it survives the service being restarted."""
+def start_local_update(action='install', token=None, allow_downgrade=False):
     import updater
-    if action == 'install':
-        candidate=updater.candidate_for_install(VERSION)
-        if candidate is None:
-            return 'No newer update downloaded yet.'
-    elif action == 'rollback':
-        if not (BASE/'updates'/'previous-app'/'deckpilot.py').is_file():
-            return 'No previous version available.'
-    else:
-        raise ValueError('Unknown update action.')
-    runner=shutil.which('systemd-run')
-    if not runner: raise ValueError('The SteamOS update helper is unavailable.')
-    cmd=[runner,'--user','--collect','--unit=deckpilot-update-'+str(int(time.time())),
-         '/usr/bin/python3',str(BASE/'app'/'updater.py'),action]
-    if action=='install':
-        cmd.append(str(candidate['path']))
-        if candidate.get('sha256'):cmd += ['--sha256', candidate['sha256']]
-    result=subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=12,check=False)
-    if result.returncode:raise ValueError('Could not start update. Current app is unchanged.')
-    return 'Update started. DeckPilot will restart; your settings are preserved.'
+    if action=='rollback':return updater.start_suite_rollback()['message']
+    if not token:raise ValueError('Review the update again before approving installation.')
+    return updater.start_suite_install(token,allow_downgrade)['message']
 
 
 def check_github_async():
     import updater
-    if not updater.release_source():
-        return 'Connect a GitHub repository first.'
-    threading.Thread(target=updater.fetch_github_update,kwargs={'installed_version':VERSION},daemon=True).start()
-    return 'Checking the GitHub release feed. Refresh in a moment.'
+    threading.Thread(target=updater.fetch_suite_update,daemon=True).start()
+    return 'Checking the approved '+updater.suite_channel()+' release feed.'
 
 
 def state_for_ui():
@@ -1668,7 +1637,7 @@ def state_for_ui():
                        'adapter': ', '.join(sorted({a for _, a in adapters})) if has_adapter else 'Advisory only',
                        'approved': cfg['approved'].get(g['appid']) == mode and cfg['approved_context'].get(g['appid']) == cfg['context'],
                        'supported': has_adapter, 'metrics': metrics, 'hint': mode_hint(mode, metrics)})
-    return {'version': VERSION, 'schema_version': 2, 'context': cfg['context'], 'profiles': cfg['profiles'],
+    return {'version': VERSION, 'build_id': BUILD_ID, 'schema_version': 2, 'context': cfg['context'], 'profiles': cfg['profiles'],
             'measurements_enabled': cfg['measurements_enabled'],
             'launch_prompt': {'protocol': 1, 'enabled': cfg['play_assistant_enabled'], 'available': True, 'native_play': False, 'method': 'deckpilot-button', 'dismissed': cfg['launch_dismissed'], 'reason': 'Opt-in DeckPilot Play button only. Native Steam Play is untouched.'},
             'enabled': cfg['enabled'], 'default': cfg['default'], 'games': result, 'count': len(result),
@@ -1700,7 +1669,7 @@ input{width:100%;border:1px solid #41516b;border-radius:10px;background:#0d1622;
 <div class="box"><h2>Steam-wide research</h2><input id="steam-query" aria-label="Steam game name or App ID" placeholder="Name or Steam App ID (including uninstalled)"/><button onclick="steamSearch()">Search Steam</button><div id="steam-results"></div><div id="research-results"></div></div>
 <div class="box"><div class="top"><div><h2 style="margin:0">Installed Steam games</h2><p id="count">Scanning library…</p></div><button onclick="refresh()">Rescan</button></div>
 <input id="search" placeholder="Find a game…" oninput="drawGames()" aria-label="Find installed game"/><div id="games"></div></div>
-<div class="box"><div class="top"><div><h2 style="margin:0">Updates</h2><p id="update-status">Checking for a newer version…</p></div><button id="install-update" onclick="installUpdate()" disabled>No update yet</button></div><p id="github-status">GitHub releases: not connected.</p><input id="github-repo" placeholder="GitHub repository: owner/name" aria-label="GitHub release repository"/><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button onclick="connectGithub()">Connect GitHub</button><button onclick="checkGithub()">Check online</button><button onclick="disconnectGithub()">Disconnect</button><button id="undo-update" onclick="undoUpdate()" style="display:none">Undo last update</button></div><small>After connecting a public GitHub releases repository, DeckPilot checks and downloads verified ZIPs in the background. You choose when to install. Until a repository is published, the existing Downloads ZIP method still works. GitHub digest and HTTPS checks provide integrity but are not a separate developer signature.</small></div>
+<div class="box"><h2>Updates</h2><p id="update-status">Checking local update status…</p><p id="github-status"></p><div style="display:flex;gap:8px;flex-wrap:wrap"><button onclick="checkGithub()">Check for Updates</button><button onclick="selectChannel('stable')">Stable</button><button onclick="selectChannel('preview')">Enable Preview</button><button id="install-update" onclick="installUpdate()" disabled>No update yet</button><button id="undo-update" onclick="undoUpdate()" style="display:none">Restore Previous App</button></div><button id="plugin-rollback" onclick="pluginRollback()" style="display:none">Prepare Plugin Rollback</button><div id="plugin-rollback-link"></div><small>Only approved goddenator/DeckPilot-TV builds. Updates never install automatically. App backups are saved; game files, preferences and saves are kept. Complete matching plugin installation or rollback in Decky → Settings → Updates. No PC or file transfer required.</small></div>
 <details class="box"><summary style="cursor:pointer;font-weight:700">Safety and restore</summary><p>DeckPilot keeps original copies before editing supported settings. Close your games before restoring. Files changed by a game after DeckPilot's edits will be left alone.</p><button onclick="restoreAll()">Restore all DeckPilot changes</button></details>
 <details class="box"><summary style="cursor:pointer;font-weight:700">Diagnostics and private Google Drive</summary><p>Optional: keep ONE constantly updated <b>DeckPilot-Latest.zip</b> in your private <b>DeckPilot Diagnostics</b> folder. No paid ChatGPT API. Reports include redacted app logs only, but redaction is best-effort. Review a local export before opting in. Connect Google Drive once using the <b>DeckPilot - Connect Drive</b> shortcut in the Desktop Mode application launcher. Nothing is uploaded until you enable it below.</p><p id="cloud-status">Checking connection…</p><button onclick="exportReport()">Export diagnostic ZIP</button> <button onclick="toggleCloud(true)">Enable Drive uploads</button> <button onclick="toggleCloud(false)">Disable Drive uploads</button> <button onclick="uploadNow()">Upload latest now</button><p id="export-status"></p></details>
 <p><small>DeckPilot never needs root access or your Steam password. MangoHud logs are optional and are only read when they can be reliably matched to a game. It cannot optimise games whose graphics settings are stored in unsupported formats. Changes to a game may not take effect until it is relaunched. Use the Safety and restore controls or the per-game Decky restore action to undo unchanged managed files.</small></p>
@@ -1720,14 +1689,15 @@ async function steamSearch(){try{const r=await localAction('search',{query:docum
 async function researchGame(appid){try{const r=await localAction('research',{appid});document.getElementById('research-results').innerHTML='<p>'+esc(r.message||'')+'</p>'+(r.sources||[]).map(s=>`<p>${esc(s.source)}: ${esc(s.status)}</p>`).join('')+(r.reports||[]).map(s=>`<p><a href="${esc(s.url)}" target="_blank" rel="noreferrer">${esc(s.source)}</a> · ${esc(s.device)} · ${esc(s.display_context)} · ${esc(s.resolution||'unknown resolution')} · ${esc(s.fps||'unknown FPS')} (${esc(s.fps_kind||'reported/unspecified')}) · ${esc(s.report_date||'unknown date')} · ${esc(s.game_version||'unknown game version')}<br>${esc(s.summary)}<br>${esc(s.uncertainty)}</p>`).join('');}catch(e){document.getElementById('feedback').innerText=e.message;}}
 async function exportReport(){try{const r=await fetch('/api/diagnostics',{method:'POST',headers:{'Content-Type':'application/json','X-DeckPilot-Token':token},body:'{}'});if(!r.ok)throw Error('Export failed');const b=await r.blob(),u=URL.createObjectURL(b),a=document.createElement('a');a.href=u;a.download='DeckPilot-Diagnostics.zip';a.click();setTimeout(()=>URL.revokeObjectURL(u),30000);document.getElementById('export-status').innerText='Report generated locally. Review it before sharing.';}catch(e){document.getElementById('export-status').innerText=e.message;}}
 async function cloudAction(action){try{let r=await fetch('/api/cloud',{method:'POST',headers:{'Content-Type':'application/json','X-DeckPilot-Token':token},body:JSON.stringify({action})});let j=await r.json();document.getElementById('export-status').innerText=j.message||j.error||'No response';await refresh();}catch(e){document.getElementById('export-status').innerText=e.message;}}
-async function checkUpdate(){try{const r=await fetch('/api/update');const j=await r.json();const b=document.getElementById('install-update');const t=document.getElementById('update-status');const undo=document.getElementById('undo-update');undo.style.display=j.can_undo?'inline-block':'none';if(j.available){b.disabled=false;b.textContent='Install v'+j.version;t.textContent='Update available: '+j.archive;}else{b.disabled=true;b.textContent='Up to date';t.textContent='v'+(info.version||'')+' installed · '+(j.status||'No newer update.')}const gh=j.github||{};document.getElementById('github-status').textContent=gh.repository?('GitHub: '+gh.repository+' · '+(gh.message||gh.status)):'GitHub releases not connected yet.';if(gh.repository&&!document.getElementById('github-repo').value)document.getElementById('github-repo').value=gh.repository;}catch(e){document.getElementById('update-status').textContent='Update check failed: '+e.message;}}
-async function githubAction(action,repository){try{let r=await fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json','X-DeckPilot-Token':token},body:JSON.stringify({action,repository})});let j=await r.json();if(!r.ok)throw Error(j.error||'GitHub action failed');document.getElementById('update-status').textContent=j.message;await checkUpdate();}catch(e){document.getElementById('update-status').textContent=e.message;}}
-function connectGithub(){const r=document.getElementById('github-repo').value.trim();if(!r)return alert('Enter the real public GitHub repository first.');if(!confirm('Trust public releases from '+r+' for update downloads? Installation will still require your approval.'))return;githubAction('connect',r);}
-function disconnectGithub(){if(confirm('Stop checking GitHub for updates?'))githubAction('disconnect','');}
-function checkGithub(){githubAction('check','');}
+let reviewedUpdate={};
+async function checkUpdate(){try{const r=await fetch('/api/update');const j=await r.json();reviewedUpdate=j.suite||{};document.getElementById('plugin-rollback').style.display=reviewedUpdate.plugin_rollback?'inline-block':'none';const b=document.getElementById('install-update');b.disabled=!j.available;b.textContent=j.available?'Install App '+j.version:'No app update';document.getElementById('undo-update').style.display=j.can_undo?'inline-block':'none';document.getElementById('update-status').textContent=j.status;document.getElementById('github-status').textContent='App '+(reviewedUpdate.app_installed||info.version||'unknown')+' · '+(reviewedUpdate.channel||'stable')+' · goddenator/DeckPilot-TV';}catch(e){document.getElementById('update-status').textContent='Update status unavailable.';}}
+async function githubAction(action,channel){try{const r=await fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json','X-DeckPilot-Token':token},body:JSON.stringify({action,channel})});const j=await r.json();if(!r.ok)throw Error(j.error||'Update check failed');await checkUpdate();document.getElementById('update-status').textContent=j.message;}catch(e){document.getElementById('update-status').textContent=e.message;}}
+function selectChannel(channel){if(channel==='preview'&&!confirm('Enable approved Preview development builds? They may contain bugs. Nothing installs automatically.'))return;githubAction('channel',channel);}
+function checkGithub(){githubAction('check');}
+async function pluginRollback(){if(!confirm('Prepare the previous plugin for Decky-approved rollback? Nothing installs automatically.'))return;try{const r=await fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json','X-DeckPilot-Token':token},body:JSON.stringify({action:'plugin-rollback'})});const j=await r.json();if(j.error)throw Error(j.error);const box=document.getElementById('plugin-rollback-link');box.replaceChildren();const label=document.createElement('p');label.textContent='Copy this five-minute local link into Decky Settings → Developer → Install from URL and approve:';const field=document.createElement('textarea');field.readOnly=true;field.value=j.url;field.setAttribute('aria-label','Plugin rollback link');box.append(label,field);try{await navigator.clipboard.writeText(j.url);}catch{field.select();}}catch(e){document.getElementById('update-status').textContent=e.message;}}
 async function undoUpdate(){if(!confirm('Restore the previous DeckPilot version? This restarts the app but preserves game profiles and backups.'))return;await updateAction('rollback');}
-async function updateAction(action){try{let r=await fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json','X-DeckPilot-Token':token},body:JSON.stringify({action})});let j=await r.json();if(!r.ok)throw Error(j.error||'Could not start installer');document.getElementById('update-status').textContent=j.message;setTimeout(()=>location.reload(),9000);}catch(e){document.getElementById('update-status').textContent='Could not start: '+e.message;document.getElementById('install-update').disabled=false;}}
-async function installUpdate(){if(!confirm('Install this DeckPilot update? The app will restart, and the previous version will be saved for rollback.'))return;const b=document.getElementById('install-update');b.disabled=true;await updateAction('install');}
+async function updateAction(action,approval={}){try{let r=await fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json','X-DeckPilot-Token':token},body:JSON.stringify({action,...approval})});let j=await r.json();if(!r.ok)throw Error(j.error||'Could not start installer');document.getElementById('update-status').textContent=j.message;setTimeout(()=>location.reload(),9000);}catch(e){document.getElementById('update-status').textContent='Could not start: '+e.message;document.getElementById('install-update').disabled=false;}}
+async function installUpdate(){const approved={token:reviewedUpdate.token,allow_downgrade:!!reviewedUpdate.downgrade};if(!approved.token)return;if(!confirm('Install app '+reviewedUpdate.version+'? '+(approved.allow_downgrade?'This is a downgrade. ':'')+'The app restarts. Preferences and game backups are kept. Complete the matching plugin in Decky.'))return;document.getElementById('install-update').disabled=true;await updateAction('install',approved);}
 function toggleCloud(enabled){if(enabled&&!confirm('Send a redacted diagnostic ZIP to your private Google Drive automatically? Review an exported report first.'))return;cloudAction(enabled?'enable':'disable');}
 function uploadNow(){cloudAction('upload');}
 async function restoreAll(){if(!confirm('Restore backed-up game settings? Please close all games first.'))return;try{let r=await fetch('/api/restore',{method:'POST',headers:{'Content-Type':'application/json','X-DeckPilot-Token':token},body:'{}'});let j=await r.json();if(!r.ok)throw Error(j.error||'Restore failed');alert(j.message);await refresh();}catch(e){alert('Restore failed: '+e.message)}}
@@ -1801,14 +1771,19 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/api/update':
                 action=payload.get('action')
                 if action in ('install','rollback'):
-                    self.send_json({'message':start_local_update(action)});return
+                    self.send_json({'message':start_local_update(action,payload.get('token'),payload.get('allow_downgrade') is True)});return
                 if action == 'check':
+                    self.send_json({'message':check_github_async()});return
+                if action == 'plugin-rollback':
+                    import updater
+                    self.send_json(updater.prepare_plugin_handoff('',None,rollback=True));return
+                if action == 'channel':
+                    import updater
+                    updater.set_suite_channel(payload.get('channel'))
                     self.send_json({'message':check_github_async()});return
                 if action in ('connect','disconnect'):
                     import updater
-                    repo=payload.get('repository','') if action=='connect' else ''
-                    self.send_json({'message':'GitHub release source '+('connected: '+repo if repo else 'disconnected.'),
-                                    'repository':updater.configure_source(repo)});return
+                    self.send_json({'message':'Updates use only goddenator/DeckPilot-TV. Select Stable or Preview in Decky Settings.'});return
                 raise ValueError('Unknown update command')
             if self.path == '/api/cloud':
                 action = payload.get('action')
@@ -1825,7 +1800,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({'ok': True, 'message': 'Restoration checked for ' + str(len(results)) + ' games. Original files were restored only where it was safe. Check the DeckPilot log for skipped files.'})
                 return
             self.send_json(save_mode(payload['mode'], payload.get('appid'), payload.get('context')))
-        except (ValueError, KeyError, json.JSONDecodeError) as ex:
+        except (ValueError, KeyError, json.JSONDecodeError, updater.UpdateError) as ex:
             self.send_json({'error': str(ex)}, 400)
 
     def send_json(self, obj, status=200):
@@ -1849,12 +1824,11 @@ def run_server():
             time.sleep(45)
     threading.Thread(target=sync_loop, daemon=True).start()
     def github_loop():
-        # Network lookups only for public repositories the user opted into.
+        # Check the fixed public release feed; never install without approval.
         while True:
             try:
                 import updater
-                if updater.release_source():
-                    updater.fetch_github_update(installed_version=VERSION)
+                updater.fetch_suite_update()
             except Exception:
                 log('GitHub update check error')
             time.sleep(21600)
@@ -1920,7 +1894,7 @@ def main():
         print(start_local_update('rollback'));return
     if args.command == 'check-github':
         import updater
-        print(json.dumps(updater.fetch_github_update(installed_version=VERSION)));return
+        print(json.dumps(updater.fetch_suite_update()));return
     if args.command == 'set-mode':
         if not args.mode: parser.error('--mode is required')
         try: print(json.dumps(save_mode(args.mode, args.appid, args.context)))

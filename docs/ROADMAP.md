@@ -1,6 +1,6 @@
 # DeckPilot development roadmap
 
-This branch is an unreleased v0.8.2 development build for PR #3 and the redesign feedback in issue #4. No release or hardware readiness is implied.
+This branch is an unreleased v0.8.3-preview.1 development build for PR #3 and the redesign feedback in issue #4. No release or hardware readiness is implied.
 
 ## Shipped in this development branch
 
@@ -11,7 +11,7 @@ This branch is an unreleased v0.8.2 development build for PR #3 and the redesign
 - Existing Unreal adapter plus native XML resolution-only support for Valheim and Hollow Knight. Unknown formats remain advisory. No save, launch-option, registry, TDP, display or VRR writes.
 - Independently attributed reports with display-context ranking and evidence confidence; retained offline data up to 30 days, labelled as cached/stale. Confidence measures matching evidence specificity and recency, not a probability of reaching FPS. Balanced remains a conservative starting recommendation, not a claim to have computed optimal game settings.
 - Optional read-only analysis of existing, attributable MangoHud FPS and real frame-time samples (off by default). This does not start recording, learn settings automatically, or upload raw measurement files.
-- Updates recheck GitHub digests at approval/installation, freeze the approved ZIP, serialize operations and recover from late record failures. Profile recovery metadata protects inactive preferences when an older app rewrites legacy fields after rollback. Drive uploads are serialized across service/Decky processes, do not hold the game-settings lock during the network request, and completing an in-flight upload cannot re-enable a disabled opt-in. Plugin updates remain a deliberate visit to the trusted release feed and approval in Decky.
+- Updates recheck GitHub digests at approval/installation, freeze the approved ZIP, serialize operations and recover from late record failures. Profile recovery metadata protects inactive preferences when an older app rewrites legacy fields after rollback. Drive uploads are serialized across service/Decky processes, do not hold the game-settings lock during the network request, and completing an in-flight upload cannot re-enable a disabled opt-in. Paired Stable/Preview updates are implemented in [the update guide](UPDATES.md); plugin installation still requires Decky confirmation and hardware validation.
 
 ## Next: experimental Play-time recommendations
 

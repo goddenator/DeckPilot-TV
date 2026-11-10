@@ -1,6 +1,7 @@
 import { ButtonItem, PanelSection, PanelSectionRow, TextField, Navigation } from '@decky/ui';
 import { useEffect, useRef, useState } from 'react';
 import { launchController } from './launch';
+import { Updates } from './Updates';
 import { LaunchView } from './LaunchView';
 import type { ReactNode } from 'react';
 import { api, Checkup, Game, Mode, Preview, Profile, Research, Result, State } from './api';
@@ -10,7 +11,7 @@ const MODES:[Mode,string,string][] = [
   ['performance','Best Performance','Smoother play'],
   ['balanced','Balanced','A bit of both'],
 ];
-type Screen = 'home'|'find'|'game'|'settings'|'advanced';
+type Screen = 'home'|'find'|'game'|'settings'|'advanced'|'updates';
 type Detail = 'main'|'review'|'restore'|'sources';
 const row = (children:ReactNode,key?:string)=><PanelSectionRow key={key}>{children}</PanelSectionRow>;
 const statusLabels:Record<string,string> = {ready:'Ready',running:'Game running','needs-review':'Review settings','manual-changes':'Your changes are safe','settings-match':'Settings match','not-installed':'Not installed',advisory:'Advice only',error:'Checkup unavailable'};
@@ -43,7 +44,7 @@ export function DeckPilotApp(){
   const [technical,setTechnical]=useState(false);
   const inFlight=useRef(false);
   const context=info.context||'docked';
-  const modern=info.schema_version===2;
+  const modern=info.schema_version===2 && (!info.update_suite || (info.update_suite.compatible===true&&!info.update_suite.recovery_required));
   const profile=info.profiles?.[context];
   const game=info.games?.find(g=>g.appid===selected?.appid)||selected;
   const mode=game?(profile?.games[game.appid]||profile?.default||info.saved_games?.[game.appid]||info.default||'balanced'):(profile?.default||info.default||'balanced');
@@ -88,11 +89,11 @@ export function DeckPilotApp(){
   const back=()=>{
     if(launchActive){if(launchController.cancel())setMessage('Play cancelled.');return;}
     if(screen==='game'&&detail!=='main'){setDetail('main');setReview(undefined);setTechnical(false);}
-    else navigate(screen==='advanced'?'settings':'home');
+    else navigate(screen==='advanced'||screen==='updates'?'settings':'home');
   };
   const evidence=research?.recommendation;
   const reportDate=(research?.reports||[]).map(r=>r.report_date).filter((date):date is string=>Boolean(date)&&Number.isFinite(Date.parse(date!))).sort().slice(-1)[0];
-  const title=screen==='home'?'DeckPilot':screen==='find'?'Find Games':screen==='settings'?'Settings':screen==='advanced'?'Advanced':game?.name||'Game Details';
+  const title=screen==='home'?'DeckPilot':screen==='find'?'Find Games':screen==='settings'?'Settings':screen==='advanced'?'Advanced':screen==='updates'?'Updates':game?.name||'Game Details';
 
   const allGames=new Map<string,Game>();
   for(const g of info.games||[])allGames.set(g.appid,g);
@@ -140,7 +141,7 @@ export function DeckPilotApp(){
       </PanelSection>
       <PanelSection title="Your choice">{modeButtons()}</PanelSection>
       <PanelSection>
-        {info.launch_prompt?.enabled&&info.launch_prompt.protocol===1&&info.games?.some(g=>g.appid===game.appid)&&bigButton('Play with DeckPilot',()=>void launchController.start({appid:game.appid,name:game.name,context,installed:true,enabled:true}),'Opt-in cached advice before launching.',checkup?.status==='running')}
+        {modern&&!offline&&info.launch_prompt?.enabled&&info.launch_prompt.protocol===1&&info.games?.some(g=>g.appid===game.appid)&&bigButton('Play with DeckPilot',()=>void launchController.start({appid:game.appid,name:game.name,context,installed:true,enabled:true}),'Opt-in cached advice before launching.',checkup?.status==='running')}
         {bigButton('Review & Apply',()=>void run(async()=>{
           const p=await api.preview(game.appid,mode,context);
           if(p.status==='preview'&&p.token&&!p.error){setReview({preview:p,mode,context,appid:game.appid});setDetail('review');}
@@ -181,20 +182,11 @@ export function DeckPilotApp(){
         {(['docked','handheld'] as Profile[]).map(c=>bigButton((context===c?'✓ ':'')+(c==='docked'?'Docked':'Handheld'),()=>void run(async()=>{setReview(undefined);setResearch(undefined);setCheckup(undefined);return api.context(c);}),undefined,!modern||offline))}
         {row(<p className="dp-small">Selected by you. Switching profiles never changes game files.</p>)}
       </PanelSection>
-      <PanelSection title="Updates">
-        {confirm==='install'||confirm==='rollback'?<>
-          {row(<p>{confirm==='install'?'Install the verified app update?':'Restore the previous app?'} Your preferences and game backups are kept. The app restarts.</p>)}
-          {bigButton('Confirm '+(confirm==='install'?'Install':'Rollback'),()=>void run(async()=>{const fn=confirm==='install'?api.installUpdate:api.rollbackUpdate;setConfirm(undefined);return fn();}))}
-          {bigButton('Cancel',()=>setConfirm(undefined))}
-        </>:<>
-          {bigButton('Check for Updates',()=>void run(api.checkUpdate))}
-          {info.update?.available&&bigButton('Review app update · v'+info.update.version,()=>setConfirm('install'))}
-          {info.update?.can_undo&&bigButton('Undo app update',()=>setConfirm('rollback'))}
-          {bigButton('Decky plugin updates',()=>Navigation.NavigateToExternalWeb('https://github.com/goddenator/DeckPilot-TV/releases'),'Review and install in Decky. Never automatic.')}
-        </>}
-      </PanelSection>
+      <PanelSection>{bigButton('Updates',()=>navigate('updates'))}</PanelSection>
       <PanelSection>{bigButton('Advanced',()=>navigate('advanced'))}</PanelSection>
     </>}
+
+    {screen==='updates'&&<Updates/>}
 
     {screen==='advanced'&&<>
       {game&&<PanelSection title={game.name}>
@@ -229,7 +221,7 @@ export function DeckPilotApp(){
       </PanelSection>
       <PanelSection title="Display & App">
         {row(<p className="dp-small">VRR capability: {info.display?.vrr_capability||'unknown'}. VRR enabled: {info.display?.vrr_enabled||'unknown'}. {info.display?.note}</p>)}
-        {row(<p className="dp-small">App {info.version||'unknown'} · Plugin 0.8.2. {info.update?.github?.message}</p>)}
+        {row(<p className="dp-small">App {info.version||'unknown'} · Plugin {info.plugin_version||'0.8.3-preview.1'}. {info.update?.github?.message}</p>)}
         {bigButton('Refresh status',()=>void run(async()=>{await refresh();return {message:'Refreshed.'};}))}
       </PanelSection>
     </>}

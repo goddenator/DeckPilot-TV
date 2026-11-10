@@ -1,4 +1,4 @@
-# DeckPilot TV — v0.8.2 development
+# DeckPilot TV — v0.8.3-preview.1 development
 
 A free, cautious Steam Deck OLED optimisation assistant with three choices: **Best Graphics**, **Best Performance**, and **Balanced**. This is an unreleased development build on PR #3; nothing is merged or published.
 
@@ -14,6 +14,8 @@ Profiles are selected manually. Switching profiles never edits files. A concrete
 Independent Deck Settings / deckverified.games, ShareDeck and SteamDeckHQ reports retain provenance, evidence confidence, and offline cache labels. Balanced is a conservative starting recommendation, not a promise of optimal or achieved performance. Optional analysis reads existing attributable FPS/frame-time logs only; it does not start a recorder or automatically learn/apply settings.
 
 **Play-time prototype:** enable it in Advanced, then use **Play with DeckPilot** on an installed game's Details screen. It offers cached advice, Apply & Play with exact preview/approval and backups, Play Without Changes, and per-game Don’t Ask Again. Steam’s **own** Play button is not intercepted. See [prototype usage, failures and device checklist](docs/PLAY-PROTOTYPE.md). The tested four-screen layout is preserved; no release is published.
+
+**Stable / Preview updates:** Settings → Updates verifies paired app/plugin builds, asks before installing, saves rollback snapshots and hands plugin installation to Decky’s supported URL installer. The first approved release and Steam Deck validation are still pending. See [update usage, publication approval and recovery](docs/UPDATES.md).
 
 See [app usage](app/README.md), [Decky usage](decky/README.md), and [research provenance](docs/RESEARCH.md).
 

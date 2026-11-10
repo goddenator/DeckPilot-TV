@@ -1,4 +1,4 @@
-# DeckPilot TV v0.8.2
+# DeckPilot TV v0.8.3-preview.1
 
 Experimental Steam Deck OLED/docked-TV research and cautious settings tool. No paid API or subscription. Community evidence does not guarantee TV performance; the official Valve dock supports up to 4K60 or 1440p120 depending on connection, not guaranteed 4K120.
 
@@ -18,7 +18,9 @@ Game Checkup verifies matching local settings, manual changes and safe restore a
 
 For a reviewed/published release, extract `DeckPilot_TV_v0.8.2.zip` in Desktop Mode and run its `install.sh` once. The installer runs as your user and keeps existing preferences/backups. This development branch does not publish a release or provide an on-device verified binary.
 
-After initial setup, use the existing trusted GitHub release feed for automatic checks/downloads and the Decky Settings update/rollback confirmation controls. Decky plugin updates remain a separate manual approval; they are never silently installed. The Desktop dashboard can connect/disconnect a trusted `owner/repo` feed. Installation requires explicit approval, a GitHub-issued SHA256 digest, a frozen archive with a digest rechecked at installation, strict ZIP/manifest validation and a successful restart check; rollback remains available. A missing release, blocked API or rate limit is reported separately. No routine manual Konsole commands are required after installation.
+For this existing installation, use **Decky → DeckPilot → Settings → Updates**. Stable is the default; Preview is an explicit opt-in. Only paired, owner-approved builds from `goddenator/DeckPilot-TV` are accepted. The app updates through its existing user service after confirmation, with restart verification and rollback. The plugin is handed to Decky's supported Install from URL confirmation using a verified, short-lived local link. The Desktop dashboard also offers channel checks, confirmed app update/rollback and a plugin rollback link if the plugin frontend is unavailable. No routine PC downloads, file transfers or terminal commands are needed.
+
+The first new updater plugin must be bootstrapped on the Deck after the first approved preview is published. No release has been published by this work, and update/restart behavior still needs Steam Deck testing. See [full update, bootstrap and recovery instructions](../docs/UPDATES.md). Existing manual installation instructions above describe initial app setup only.
 
 ## Private diagnostics
 

@@ -27,15 +27,15 @@ def deck_command_environment():
 
 
 class Plugin:
-    async def _run(self, *args):
+    async def _run(self, *args, update_helper=False):
         try:
             home, env, identity = deck_command_environment()
-            app = home / '.local/share/deckpilot-tv/app/deckpilot.py'
+            app = Path(__file__).with_name('update_client.py') if update_helper else home / '.local/share/deckpilot-tv/app/deckpilot.py'
             if not app.is_file(): return {'ok': False, 'error': 'Install DeckPilot TV app first.'}
             proc = await asyncio.create_subprocess_exec(
                 '/usr/bin/python3', str(app), *args, cwd=str(home),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env, **identity)
-            try: stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120 if args and args[0]=='cloud-upload' else 45)
+            try: stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180 if update_helper and args and args[0]=='suite-check' else 120 if args and args[0]=='cloud-upload' else 45)
             except asyncio.TimeoutError:
                 proc.kill(); await proc.communicate()
                 return {'ok': False, 'error': 'DeckPilot took too long to respond.'}
@@ -46,7 +46,31 @@ class Plugin:
         except (OSError, ValueError, KeyError):
             return {'ok': False, 'error': 'Cannot run DeckPilot as deck. Verify the app installation and Decky user configuration.'}
 
-    async def get_state(self): return await self._run('plugin-state')
+    def _plugin_version(self):
+        try:return json.loads(Path(__file__).with_name('package.json').read_text())['version']
+        except (OSError,ValueError,KeyError):return 'unknown'
+
+    async def get_state(self):
+        state=await self._run('plugin-state')
+        if not isinstance(state,dict):state={'ok':False,'error':'App state unavailable.'}
+        state['plugin_version']=self._plugin_version()
+        state['update_suite']=await self.get_updates()
+        return state
+
+    async def get_updates(self):
+        return await self._run('suite-status','--plugin-version',self._plugin_version(),update_helper=True)
+    async def check_updates(self):
+        return await self._run('suite-check','--plugin-version',self._plugin_version(),update_helper=True)
+    async def set_update_channel(self, channel: str):
+        if channel not in ('stable','preview'):return {'ok':False,'error':'Unknown channel'}
+        return await self._run('suite-channel','--channel',channel,update_helper=True)
+    async def update_app(self, token: str, downgrade: bool=False):
+        if not isinstance(downgrade,bool):return {'ok':False,'error':'Expected approval'}
+        return await self._run('suite-install','--token',token,*(['--allow-downgrade'] if downgrade else []),update_helper=True)
+    async def plugin_handoff(self, token: str='', rollback: bool=False):
+        if not isinstance(rollback,bool):return {'ok':False,'error':'Expected approval'}
+        return await self._run('plugin-rollback' if rollback else 'plugin-handoff','--token',token,'--plugin-dir',str(Path(__file__).parent),update_helper=True)
+
     async def set_mode(self, mode: str, appid: str = '', context: str = ''):
         if mode not in ('graphics', 'performance', 'balanced'): return {'ok': False, 'error': 'Unknown mode'}
         if appid and (not appid.isascii() or not appid.isdigit()): return {'ok': False, 'error': 'Invalid game id'}
@@ -83,7 +107,7 @@ class Plugin:
     async def dismiss_play_advice(self, appid: str, dismissed: bool):
         if not isinstance(dismissed, bool): return {'ok':False,'error':'Expected on/off'}
         return await self._run('play-dismiss' if dismissed else 'play-reset', str(appid))
-    async def check_github(self): return await self._run('check-github')
+    async def check_github(self): return await self.check_updates()
     async def install_update(self): return await self._run('install-update')
-    async def rollback_update(self): return await self._run('rollback-update')
+    async def rollback_update(self): return await self._run('suite-rollback',update_helper=True)
     async def _main(self): decky.logger.info('DeckPilot TV plugin started')
