@@ -11,8 +11,12 @@ on:
       mode:
         description: Preflight never creates a tag or release
         type: choice
-        options: [preflight, publish]
+        options: [preflight, publish, recover]
         default: preflight
+      recovery_id:
+        description: Exact existing draft ID (required for Recover; optional for recovery Preflight)
+        required: false
+        default: ''
       channel:
         type: choice
         options: [preview, stable]
@@ -22,12 +26,13 @@ permissions:
   actions: read
 jobs:
   guard:
-    if: github.event_name == 'workflow_dispatch' || ((github.event.label.name == 'deckpilot:publish-preview' || github.event.label.name == 'deckpilot:preflight-preview') && github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name == 'workflow_dispatch' || ((github.event.label.name == 'deckpilot:publish-preview' || github.event.label.name == 'deckpilot:preflight-preview' || startsWith(github.event.label.name, 'deckpilot:recover-preview:') || startsWith(github.event.label.name, 'deckpilot:preflight-recovery:')) && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.guard.outputs.sha }}
       channel: ${{ steps.guard.outputs.channel }}
       mode: ${{ steps.guard.outputs.mode }}
+      recovery_id: ${{ steps.guard.outputs.recovery_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,10 +66,11 @@ jobs:
           APPROVED_SHA: ${{ needs.guard.outputs.sha }}
           APPROVED_CHANNEL: ${{ needs.guard.outputs.channel }}
           APPROVED_MODE: ${{ needs.guard.outputs.mode }}
+          RECOVER_DRAFT_ID: ${{ needs.guard.outputs.recovery_id }}
         with:
           script: |
             const {revalidate} = require('./.github/scripts/publication-guard.cjs');
-            await revalidate(github, context, {sha:process.env.APPROVED_SHA, channel:process.env.APPROVED_CHANNEL, mode:process.env.APPROVED_MODE});
+            await revalidate(github, context, {sha:process.env.APPROVED_SHA, channel:process.env.APPROVED_CHANNEL, mode:process.env.APPROVED_MODE, recovery_id:process.env.RECOVER_DRAFT_ID});
       - name: Verify reviewed build
         run: |
           node --test .github/scripts/publication-guard.test.cjs
@@ -82,11 +88,32 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           APPROVED_SHA: ${{ needs.guard.outputs.sha }}
           APPROVED_CHANNEL: ${{ needs.guard.outputs.channel }}
-        run: python3 tools/publish_approved.py --preflight
+          APPROVED_MODE: ${{ needs.guard.outputs.mode }}
+          RECOVER_DRAFT_ID: ${{ needs.guard.outputs.recovery_id }}
+        run: |
+          args=(--preflight)
+          if [[ -n "$RECOVER_DRAFT_ID" ]]; then args+=(--recover-draft-id "$RECOVER_DRAFT_ID"); fi
+          python3 tools/publish_approved.py "${args[@]}"
+      - name: Revalidate approval immediately before publication
+        uses: actions/github-script@v7
+        env:
+          APPROVED_SHA: ${{ needs.guard.outputs.sha }}
+          APPROVED_CHANNEL: ${{ needs.guard.outputs.channel }}
+          APPROVED_MODE: ${{ needs.guard.outputs.mode }}
+          RECOVER_DRAFT_ID: ${{ needs.guard.outputs.recovery_id }}
+        with:
+          script: |
+            const {revalidate} = require('./.github/scripts/publication-guard.cjs');
+            await revalidate(github, context, {sha:process.env.APPROVED_SHA, channel:process.env.APPROVED_CHANNEL, mode:process.env.APPROVED_MODE, recovery_id:process.env.RECOVER_DRAFT_ID});
       - name: Publish verified immutable pair
-        if: needs.guard.outputs.mode == 'publish'
+        if: needs.guard.outputs.mode == 'publish' || needs.guard.outputs.mode == 'recover'
         env:
           GH_TOKEN: ${{ github.token }}
           APPROVED_SHA: ${{ needs.guard.outputs.sha }}
           APPROVED_CHANNEL: ${{ needs.guard.outputs.channel }}
-        run: python3 tools/publish_approved.py
+          APPROVED_MODE: ${{ needs.guard.outputs.mode }}
+          RECOVER_DRAFT_ID: ${{ needs.guard.outputs.recovery_id }}
+        run: |
+          args=()
+          if [[ "$APPROVED_MODE" == recover ]]; then args+=(--recover-draft-id "$RECOVER_DRAFT_ID"); fi
+          python3 tools/publish_approved.py "${args[@]}"

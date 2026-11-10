@@ -1,4 +1,4 @@
-# DeckPilot TV — v0.8.3-preview.1 development
+# DeckPilot TV — v0.8.3-preview.2 development
 
 A free, cautious Steam Deck OLED optimisation assistant with three choices: **Best Graphics**, **Best Performance**, and **Balanced**. This is an unreleased development build on PR #3; nothing is merged or published.
 
@@ -24,6 +24,7 @@ See [app usage](app/README.md), [Decky usage](decky/README.md), and [research pr
 Use the existing checkout; no worktree is needed. Python 3.10+ and Node 22+:
 
 ```bash
+node --test .github/scripts/publication-guard.test.cjs
 python3 -m unittest discover -s app -v
 bash -n app/install.sh app/setup_drive.sh app/uninstall.sh app/check.sh
 cd decky

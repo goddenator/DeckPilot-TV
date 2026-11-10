@@ -4,18 +4,22 @@ const REPO = 'DeckPilot-TV';
 const LABELS = {'deckpilot:publish-preview': 'publish', 'deckpilot:preflight-preview': 'preflight'};
 function selection(context) {
   if (context.repo.owner !== OWNER || context.repo.repo !== REPO) throw Error('Unexpected repository');
-  let sha, channel, mode;
+  let sha, channel, mode, recovery_id = '';
   if (context.eventName === 'pull_request') {
     const pr = context.payload.pull_request;
     if (pr?.head?.repo?.full_name !== `${OWNER}/${REPO}` || pr?.base?.repo?.full_name !== `${OWNER}/${REPO}` || pr.base.ref !== 'main' || pr.state !== 'open') throw Error('Only an open same-repository PR targeting main is supported');
-    mode = LABELS[context.payload.label?.name];
+    const label=context.payload.label?.name || '';
+    const recovery=/^deckpilot:(recover-preview|preflight-recovery):([1-9][0-9]*)$/.exec(label);
+    mode = LABELS[label];
+    if(recovery){mode=recovery[1]==='recover-preview'?'recover':'preflight';recovery_id=recovery[2];}
     if (!mode) throw Error('An explicit publication or preflight label is required');
     sha = pr.head.sha; channel = 'preview';
   } else if (context.eventName === 'workflow_dispatch') {
-    ({commit: sha, channel, mode = 'preflight'} = context.payload.inputs);
+    ({commit: sha, channel, mode = 'preflight', recovery_id = ''} = context.payload.inputs);
   } else throw Error('Publication is never triggered by a push');
-  if (!/^[a-f0-9]{40}$/.test(sha) || !['stable', 'preview'].includes(channel) || !['publish', 'preflight'].includes(mode)) throw Error('Exact reviewed SHA, channel and mode required');
-  return {sha, channel, mode};
+  if (!/^[a-f0-9]{40}$/.test(sha) || !['stable', 'preview'].includes(channel) || !['publish', 'preflight', 'recover'].includes(mode)) throw Error('Exact reviewed SHA, channel and mode required');
+  if ((recovery_id && (!/^[1-9][0-9]*$/.test(recovery_id) || mode==='publish')) || (mode==='recover' && !recovery_id)) throw Error('Explicit exact recovery ID required; never recover implicitly');
+  return {sha, channel, mode, recovery_id};
 }
 async function ownerProtection(github, context, channel) {
   const env = await github.rest.repos.getEnvironment({...context.repo, environment_name: `deckpilot-${channel}-publish`});
@@ -29,7 +33,7 @@ async function guard(github, context, core) {
 }
 async function revalidate(github, context, approved) {
   const selected = selection(context);
-  if (selected.sha !== approved.sha || selected.channel !== approved.channel || selected.mode !== approved.mode) throw Error('Approved selection changed');
+  if (selected.sha !== approved.sha || selected.channel !== approved.channel || selected.mode !== approved.mode || selected.recovery_id !== approved.recovery_id) throw Error('Approved selection changed');
   // Recheck protection after the environment gate as well as before it.
   await ownerProtection(github, context, selected.channel);
   if (context.eventName === 'pull_request') {

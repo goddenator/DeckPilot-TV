@@ -14,6 +14,15 @@ APP_FILES = ['deckpilot.py', 'updater.py', 'README.md', 'VERSION.txt', 'install.
              'uninstall.sh', 'check.sh', 'setup_drive.sh', 'test_deckpilot.py', 'test_updater.py']
 
 
+def write_member(archive,name,data):
+    # Stable ZIP metadata lets an explicitly approved same-commit retry compare
+    # the exact original four asset digests rather than changing checkout times.
+    entry=zipfile.ZipInfo(name,date_time=(1980,1,1,0,0,0))
+    entry.create_system=3;entry.external_attr=0o100644 << 16
+    entry.compress_type=zipfile.ZIP_DEFLATED
+    archive.writestr(entry,data)
+
+
 def package(output, version=None):
     src = ROOT/'app'
     source_version = re.search(r"^VERSION = '(\d+\.\d+\.\d+)'", (src/'deckpilot.py').read_text(), re.M).group(1)
@@ -33,13 +42,13 @@ def package(output, version=None):
         for name in APP_FILES:
             data = (src/name).read_bytes()
             manifest['files'][name] = hashlib.sha256(data).hexdigest()
-            archive.writestr(folder+'/'+name,data)
-        archive.writestr(folder+'/deckpilot-release.json',json.dumps(manifest,indent=2)+'\n')
+            write_member(archive,folder+'/'+name,data)
+        write_member(archive,folder+'/deckpilot-release.json',(json.dumps(manifest,indent=2)+'\n').encode())
     pluginzip=output/('DeckPilot_Decky_v'+version+'.zip')
     with zipfile.ZipFile(pluginzip,'w',zipfile.ZIP_DEFLATED) as archive:
         for name in ['plugin.json','package.json','main.py','LICENSE','README.md','dist/index.js']:
-            archive.write(ROOT/'decky'/name,'DeckPilot/'+name)
-        archive.write(src/'updater.py','DeckPilot/update_client.py')
+            write_member(archive,'DeckPilot/'+name,(ROOT/'decky'/name).read_bytes())
+        write_member(archive,'DeckPilot/update_client.py',(src/'updater.py').read_bytes())
     channel='preview' if '-preview.' in version else 'stable'
     suite={'format':1,'product':'deckpilot-tv-suite','repository':'goddenator/DeckPilot-TV','version':version,'tag':'v'+version,'channel':channel,
            'commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()}

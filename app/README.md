@@ -1,4 +1,4 @@
-# DeckPilot TV v0.8.3-preview.1
+# DeckPilot TV v0.8.3-preview.2
 
 Experimental Steam Deck OLED/docked-TV research and cautious settings tool. No paid API or subscription. Community evidence does not guarantee TV performance; the official Valve dock supports up to 4K60 or 1440p120 depending on connection, not guaranteed 4K120.
 

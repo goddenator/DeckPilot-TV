@@ -1,6 +1,6 @@
 # DeckPilot development roadmap
 
-This branch is an unreleased v0.8.3-preview.1 development build for PR #3 and the redesign feedback in issue #4. No release or hardware readiness is implied.
+This branch is an unreleased v0.8.3-preview.2 development build for PR #3 and the redesign feedback in issue #4. No release or hardware readiness is implied.
 
 ## Shipped in this development branch
 
