@@ -34,7 +34,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 VERSION = '0.8.3'
-BUILD_ID = '0.8.3-preview.4'
+BUILD_ID = '0.8.3-preview.5'
 APP = 'deckpilot-tv'
 PORT = 38647
 MODES = {'graphics', 'performance', 'balanced'}
@@ -1619,6 +1619,7 @@ def diagnostic_report(include_process=False):
         **({'process_checks':[game_running_state(g['appid']) for g in games[:8]],
             'settings_coverage':[settings_coverage(g) for g in games[:100]]} if include_process else {}),
         'format': 1, 'app': 'DeckPilot TV', 'version': VERSION, 'build_id': BUILD_ID,
+        'updates': updater.update_diagnostic_summary(),
         'created_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
         'operating_system': os_name[:120], 'kernel': platform.release()[:120],
         'python_version': platform.python_version(),
@@ -1949,6 +1950,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.valid_host(): self.send_error(403); return
         route = urllib.parse.urlparse(self.path).path
+        if route == '/api/identity':
+            self.send_json({'version': VERSION, 'build_id': BUILD_ID}); return
         if route == '/api/state':
             self.send_json(state_for_ui()); return
         if route == '/api/update':

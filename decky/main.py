@@ -63,15 +63,22 @@ class Plugin:
         return await self._run('process-status',str(appid),'--context',context)
 
     async def get_updates(self):
-        return await self._run('suite-status','--plugin-version',self._plugin_version(),update_helper=True)
+        return await self._run('suite-status','--plugin-version',self._plugin_version(),'--plugin-dir',str(Path(__file__).parent),update_helper=True)
     async def check_updates(self):
-        return await self._run('suite-check','--plugin-version',self._plugin_version(),update_helper=True)
+        return await self._run('suite-check','--plugin-version',self._plugin_version(),'--plugin-dir',str(Path(__file__).parent),update_helper=True)
+    async def verify_update_installation(self):
+        return await self._run('suite-verify','--plugin-dir',str(Path(__file__).parent),update_helper=True)
     async def set_update_channel(self, channel: str):
         if channel not in ('stable','preview'):return {'ok':False,'error':'Unknown channel'}
         return await self._run('suite-channel','--channel',channel,update_helper=True)
     async def update_app(self, token: str, downgrade: bool=False):
         if not isinstance(downgrade,bool):return {'ok':False,'error':'Expected approval'}
         return await self._run('suite-install','--token',token,*(['--allow-downgrade'] if downgrade else []),update_helper=True)
+    async def prepare_plugin_file(self, token: str='', rollback: bool=False):
+        if not isinstance(rollback,bool):return {'ok':False,'error':'Expected approval'}
+        return await self._run('plugin-prepare-rollback' if rollback else 'plugin-prepare-file',
+                               '--token',str(token),'--plugin-dir',str(Path(__file__).parent),update_helper=True)
+
     async def plugin_handoff(self, token: str='', rollback: bool=False):
         if not isinstance(rollback,bool):return {'ok':False,'error':'Expected approval'}
         return await self._run('plugin-rollback' if rollback else 'plugin-handoff','--token',token,'--plugin-dir',str(Path(__file__).parent),update_helper=True)

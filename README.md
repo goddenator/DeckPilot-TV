@@ -1,6 +1,6 @@
-# DeckPilot TV — v0.8.3-preview.4 development
+# DeckPilot TV — v0.8.3-preview.5 development
 
-Preview.4 investigation, limitations and controller-only device checks: [docs/PREVIEW-4.md](docs/PREVIEW-4.md).
+Stage 1: [Gaming Mode updates, limitations and device checklist](docs/PREVIEW-5.md). [Full implementation programme](docs/IMPLEMENTATION-PLAN.md). Published preview.4 remains unchanged.
 
 A free, cautious Steam Deck OLED optimisation assistant with three choices: **Best Graphics**, **Best Performance**, and **Balanced**. This is an unreleased development build on PR #3; nothing is merged or published.
 
@@ -17,7 +17,7 @@ Independent Deck Settings / deckverified.games, ShareDeck and SteamDeckHQ report
 
 **Play-time prototype:** enable it in Advanced, then use **Play with DeckPilot** on an installed game's Details screen. It offers cached advice, Apply & Play with exact preview/approval and backups, Play Without Changes, and per-game Don’t Ask Again. Steam’s **own** Play button is not intercepted. See [prototype usage, failures and device checklist](docs/PLAY-PROTOTYPE.md). The tested four-screen layout is preserved; no release is published.
 
-**Stable / Preview updates:** Settings → Updates verifies paired app/plugin builds, asks before installing, saves rollback snapshots and hands plugin installation to Decky’s supported URL installer. The first approved release and Steam Deck validation are still pending. See [update usage, publication approval and recovery](docs/UPDATES.md).
+**Stable / Preview updates:** Settings → Updates provides Update Everything, app-first restart verification and a verified ZIP prepared for Decky’s Gaming Mode file picker. Loader still asks before installing; exact installed-file verification is required before Done. The new path needs Steam Deck validation. See [update usage, publication approval and recovery](docs/UPDATES.md).
 
 See [app usage](app/README.md), [Decky usage](decky/README.md), and [research provenance](docs/RESEARCH.md).
 

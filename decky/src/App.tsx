@@ -228,7 +228,7 @@ export function DeckPilotApp(){
       </PanelSection>
       <PanelSection title="Display & App">
         {row(<p className="dp-small">VRR capability: {info.display?.vrr_capability||'unknown'}. VRR enabled: {info.display?.vrr_enabled||'unknown'}. {info.display?.note}</p>)}
-        {row(<p className="dp-small">App {info.build_id||info.version||'unknown'} · Plugin {info.plugin_version||'0.8.3-preview.4'}. {info.update?.github?.message}</p>)}
+        {row(<p className="dp-small">App {info.build_id||info.version||'unknown'} · Plugin {info.plugin_version||'0.8.3-preview.5'}. {info.update?.github?.message}</p>)}
         {bigButton('Refresh status',()=>void run(async()=>{await refresh();return {message:'Refreshed.'};}))}
       </PanelSection>
     </>}

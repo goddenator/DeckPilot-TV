@@ -1,6 +1,6 @@
 # DeckPilot development roadmap
 
-This branch is an unreleased v0.8.3-preview.4 development build for PR #3 and the redesign feedback in issue #4. No release or hardware readiness is implied.
+This branch is an unreleased v0.8.3-preview.5 development build for PR #3 and the redesign feedback in issue #4. No release or hardware readiness is implied.
 
 ## Shipped in this development branch
 
@@ -56,3 +56,5 @@ The lower-risk first experiment is an **opt-in DeckPilot-controlled Play button*
 9. On a separately reviewed release, test automatic verified app download → explicit install approval → healthy restart → rollback with both profile preferences and all game backups preserved. Verify a changed ZIP is rejected. Plugin updates must require separate manual approval.
 
 Release acceptance remains review, green CI for the exact head, on-device checks, a separately approved tag/release with GitHub-issued digest, and installation/rollback validation. No merge, tag or release is part of this task.
+
+The major reliability programme is staged in [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md). Stage 1 implements Gaming Mode file-picker update preparation and verification; see [PREVIEW-5.md](PREVIEW-5.md). The actual Deck running-state blocker and ATS/FFX adapters remain unresolved.

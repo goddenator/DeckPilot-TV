@@ -1,4 +1,10 @@
-# Stable / Preview updates — v0.8.3-preview.2
+# Gaming Mode updates — preview.5 development
+
+Current update flow, one-time Gaming Mode bootstrap from published preview.4, verification, recovery and actual Deck acceptance steps: [PREVIEW-5.md](PREVIEW-5.md). No release has been published by this development work. Routine plugin updates prepare a verified local ZIP for Decky's visible Home → DeckPilot Updates folder; the old URL handoff below is a separate fallback, not the primary new flow. The protected publication/recovery contract below remains unchanged.
+
+## Earlier URL-handoff implementation and publication history
+
+### Stable / Preview updates — v0.8.3-preview.2 history
 
 This is implemented development code for issue #5, not a published release or an on-device validation claim. The user-tested v0.8.1 layout and v0.8.2 controlled Play prototype remain in place. Steam's native Play is still untouched.
 

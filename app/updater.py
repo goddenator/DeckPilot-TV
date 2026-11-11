@@ -355,7 +355,8 @@ def candidate_for_install(installed_version=None):
     return online if version_tuple(online['version'])>version_tuple(local['version']) else local
 
 
-def record(status, message, version=None, updates=UPDATES):
+def record(status, message, version=None, updates=None):
+    updates = Path(UPDATES if updates is None else updates)
     updates.mkdir(parents=True, exist_ok=True)
     result = {'status': status, 'message': message, 'version': version,
               'timestamp_utc': dt.datetime.now(dt.timezone.utc).isoformat()}
@@ -374,12 +375,7 @@ def service_call(action):
 def healthy(version, timeout=18):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen('http://127.0.0.1:38647/api/state', timeout=3) as resp:
-                if (lambda state: state.get('build_id',state.get('version')))(json.load(resp)) == version:
-                    return True
-        except (OSError, ValueError):
-            pass
+        if running_app_version() == version: return True
         time.sleep(.7)
     return False
 
@@ -567,23 +563,23 @@ def semver(value):
 
 def suite_channel():
     try:
-        value=json.loads(CHANNEL_FILE.read_text()).get('channel','stable')
+        value=bounded_json(CHANNEL_FILE).get('channel','stable')
         return value if value in ('stable','preview') else 'stable'
-    except (OSError,ValueError,AttributeError): return 'stable'
+    except (OSError,ValueError,AttributeError,UpdateError): return 'stable'
 
 
 def set_suite_channel(channel):
     if channel not in ('stable','preview'): raise UpdateError('Choose Stable or Preview.')
     with update_lock(UPDATES):
+        if (UPDATES/'transaction.json').exists() or update_operation_active():raise UpdateError('Finish or recover the current update before changing channels.')
         atomic_record(CHANNEL_FILE,{'channel':channel})
     return {'ok':True,'message':channel.title()+' selected. No installation or downgrade was started.'}
 
 
 def read_suite_state():
     try:
-        value=json.loads(SUITE_STATE.read_text())
-        return value if isinstance(value,dict) else {}
-    except (OSError,ValueError):return {}
+        return bounded_json(SUITE_STATE)
+    except (OSError,ValueError,UpdateError):return {}
 
 
 def suite_record(status,message,**values):
@@ -733,7 +729,7 @@ def fetch_suite_update():
         return suite_record('error',message)
 
 
-def suite_proposal(token=None):
+def suite_proposal(token=None, verify_files=True):
     state=read_suite_state()
     if state.get('status')!='ready' or not state.get('proposal') or (token is not None and token!=state.get('token')):
         raise UpdateError('Update changed or is unavailable. Check and review again.')
@@ -742,41 +738,49 @@ def suite_proposal(token=None):
     if manifest['channel']!=suite_channel():raise UpdateError('Channel changed. Check and review again.')
     expected_folder=(UPDATES/'suite-cache'/version).resolve()
     if Path(proposal['folder']).resolve()!=expected_folder:raise UpdateError('Invalid staged update location.')
-    for kind,limit in (('app',MAX_ZIP_BYTES),('plugin',MAX_PLUGIN_BYTES)):
+    for kind,limit in ((('app',MAX_ZIP_BYTES),('plugin',MAX_PLUGIN_BYTES)) if verify_files else ()):
         asset=proposal['assets'][kind];path=expected_folder/asset['name']
         if path.is_symlink() or path.stat().st_size>limit or hashlib.sha256(path.read_bytes()).hexdigest()!=asset['sha256']:
             raise UpdateError('Staged update changed. Download it again.')
     return state
 
 
-def suite_status(plugin_version=None):
+def suite_status(plugin_version=None, plugin_dir=None):
     app=current_version();state=read_suite_state();channel=suite_channel()
-    result={'recovery_required':(UPDATES/'transaction.json').exists(),'protocol':1,'channel':channel,'repository':TRUSTED_REPOSITORY,'app_installed':app,'plugin_installed':plugin_version,
+    result={'recovery_required':(UPDATES/'transaction.json').exists() and not update_operation_active(),'protocol':1,'channel':channel,'repository':TRUSTED_REPOSITORY,'app_installed':app,'plugin_installed':plugin_version,
             'status':state.get('status','idle'),'message':state.get('message','Check for approved updates.'),
             'app_rollback':(UPDATES/'previous-app/deckpilot.py').is_file() or (UPDATES/'transaction.json').exists(),
             'plugin_rollback':(UPDATES/'plugin-rollback.json').is_file(),
             'compatible':plugin_version is not None and plugin_version==app}
     try:
-        work=json.loads((UPDATES/'result.json').read_text())
+        work=bounded_json(UPDATES/'result.json')
+        if not isinstance(work,dict):raise ValueError('Invalid operation state')
         if work.get('status')=='queued':
-            try:approved=json.loads((UPDATES/'approved-app.json').read_text())
-            except (OSError,ValueError):approved={}
-            if time.time()-approved.get('approved_at',0)>180:work={**work,'status':'error','message':'Queued update did not start. Review and retry.'}
+            try:approved=bounded_json(UPDATES/'approved-app.json')
+            except (OSError,ValueError,UpdateError):approved={}
+            stamp = dt.datetime.fromisoformat(work['timestamp_utc']).timestamp() if isinstance(work.get('timestamp_utc'),str) else approved.get('approved_at',0)
+            if time.time()-stamp>180:work={**work,'status':'error','message':'Queued update did not start. Review and retry.'}
         result['operation']=work
-    except (OSError,ValueError):pass
+    except (OSError,ValueError,TypeError,UpdateError):pass
     if state.get('channel')==channel and state.get('status')=='ready':
         try:
-            checked=suite_proposal();manifest=checked['proposal']['manifest'];version=manifest['version']
+            checked=suite_proposal(verify_files=False);manifest=checked['proposal']['manifest'];version=manifest['version']
             result.update(available=app!=version or plugin_version!=version,version=version,token=checked['token'],commit=manifest['commit'],
                           app_needed=app!=version,plugin_needed=plugin_version!=version,
                           downgrade=semver(version)<semver(app),app_first=app!=version or result['recovery_required'] or result.get('operation',{}).get('status') in ('queued','working'))
-        except (OSError,ValueError,KeyError,UpdateError):result.update(status='error',message='Staged update is invalid. Check again.')
+        except (OSError,ValueError,KeyError,TypeError,UpdateError):result.update(status='error',message='Staged update is invalid. Check again.')
+    if plugin_dir is not None:
+        runtime = running_app_version()
+        result['app_running'] = runtime
+        result['app_healthy'] = runtime == app
+        result['installation'] = plugin_installation_status(plugin_dir, runtime)
     return result
 
 
 def start_suite_install(token,allow_downgrade=False):
     with update_lock(UPDATES):
         if (UPDATES/'transaction.json').exists():raise UpdateError('Restore the interrupted app update first.')
+        if update_operation_active():raise UpdateError('An approved update or rollback is already in progress.')
         state=suite_proposal(token);version=state['proposal']['manifest']['version']
         if semver(version)<semver(current_version()) and not allow_downgrade:raise UpdateError('Downgrade needs explicit approval.')
         runner=shutil.which('systemd-run')
@@ -811,22 +815,39 @@ def perform_suite_install(token,allow_downgrade=False):
     return install_archive(path,expected_sha256=asset['sha256'],allow_older=allow_downgrade or current_version()==version,expected_version=version)
 
 
+def update_operation_active():
+    try:
+        work = bounded_json(UPDATES / 'result.json')
+        if work.get('status') not in ('queued', 'working'): return False
+        stamp = dt.datetime.fromisoformat(work['timestamp_utc']).timestamp()
+        return -5 <= time.time() - stamp < 180
+    except (OSError, ValueError, KeyError, TypeError, UpdateError): return False
+
+
 def start_suite_rollback():
-    interrupted=(UPDATES/'transaction.json').is_file()
-    if not interrupted and not (UPDATES/'previous-app/deckpilot.py').is_file():raise UpdateError('No app rollback is saved.')
-    runner=shutil.which('systemd-run')
-    if not runner:raise UpdateError('SteamOS user service unavailable.')
-    cmd=[runner,'--user','--collect','--unit=deckpilot-rollback-'+str(time.time_ns()),sys.executable,str(Path(__file__).resolve()),'recover-interrupted' if interrupted else 'rollback']
-    if subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=12,check=False).returncode:
-        raise UpdateError('Could not start app rollback.')
-    return {'ok':True,'message':'App rollback started. Plugin rollback is a separate Decky-approved step.'}
+    with update_lock(UPDATES):
+        if update_operation_active(): raise UpdateError('An update or rollback is already in progress.')
+        interrupted=(UPDATES/'transaction.json').is_file()
+        if not interrupted and not (UPDATES/'previous-app/deckpilot.py').is_file():raise UpdateError('No app rollback is saved.')
+        runner=shutil.which('systemd-run')
+        if not runner:raise UpdateError('SteamOS user service unavailable.')
+        cmd=[runner,'--user','--collect','--unit=deckpilot-rollback-'+str(time.time_ns()),sys.executable,str(Path(__file__).resolve()),'recover-interrupted' if interrupted else 'rollback']
+        record('queued','Approved app recovery queued; waiting for the user service.')
+        try:
+            result=subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=12,check=False)
+            if result.returncode: raise UpdateError('Could not start app rollback.')
+        except (OSError,subprocess.TimeoutExpired,UpdateError) as exc:
+            record('error','App recovery could not be queued. Existing files and recovery snapshots are preserved.')
+            raise UpdateError('Could not start app rollback. Review and retry.') from exc
+        return {'ok':True,'message':'App rollback started. Plugin rollback is a separate Decky-approved step.'}
 
 
 def snapshot_plugin(plugin_dir):
-    root=Path(plugin_dir).resolve();package=json.loads((root/'package.json').read_text());version=package['version'];semver(version)
+    root=Path(plugin_dir).resolve();package=bounded_json(root/'package.json');version=package['version'];semver(version)
     dest=UPDATES/'plugin-backups'/('DeckPilot_Decky_v'+version+'.zip');dest.parent.mkdir(parents=True,exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=dest.parent,suffix='.zip',delete=False) as handle:temp=Path(handle.name)
     try:
+        captured={}
         with zipfile.ZipFile(temp,'w',zipfile.ZIP_DEFLATED) as z:
             for name in sorted(PLUGIN_FILES):
                 source=root/name
@@ -835,10 +856,216 @@ def snapshot_plugin(plugin_dir):
                     raise UpdateError('Current plugin is incomplete; rollback snapshot unavailable.')
                 if source.is_symlink() or not source.resolve().is_relative_to(root) or source.stat().st_size>MAX_FILE_BYTES:
                     raise UpdateError('Unsafe current plugin file.')
-                z.writestr('DeckPilot/'+name,source.read_bytes())
+                with source.open('rb') as handle:raw=handle.read(MAX_FILE_BYTES+1)
+                if len(raw)>MAX_FILE_BYTES:raise UpdateError('Current plugin file grew during snapshot.')
+                captured[name]=hashlib.sha256(raw).hexdigest()
+                z.writestr('DeckPilot/'+name,raw)
+        for name,digest in captured.items():
+            source=root/name
+            if source.is_symlink() or not source.resolve().is_relative_to(root):raise UpdateError('Plugin changed during snapshot.')
+            with source.open('rb') as handle:raw=handle.read(MAX_FILE_BYTES+1)
+            if len(raw)>MAX_FILE_BYTES or hashlib.sha256(raw).hexdigest()!=digest:raise UpdateError('Plugin changed during snapshot. Refresh before retrying.')
         inspect_plugin_zip(temp,version,legacy=True);temp.replace(dest)
     finally:temp.unlink(missing_ok=True)
     return {'version':version,'path':str(dest),'sha256':hashlib.sha256(dest.read_bytes()).hexdigest()}
+
+
+# This folder is deliberately visible to Decky's home-starting file picker.
+PLUGIN_PICKUP = Path.home() / 'DeckPilot Updates'
+PLUGIN_RECEIPT = 'plugin-install.json'
+PICKUP_MARKER = {'format': 1, 'product': 'deckpilot-tv-plugin-pickup'}
+
+
+def bounded_json(path, limit=65536):
+    with Path(path).open('rb') as handle: raw = handle.read(limit + 1)
+    if len(raw) > limit: raise UpdateError('Local update record exceeds its safety limit.')
+    value = json.loads(raw)
+    if not isinstance(value, dict): raise UpdateError('Invalid local update record.')
+    return value
+
+
+def plugin_fingerprints(path, version, legacy=False):
+    inspect_plugin_zip(path, version, legacy=legacy)
+    with zipfile.ZipFile(path) as archive:
+        return {entry.filename.removeprefix('DeckPilot/'): {'size': entry.file_size,
+                'sha256': hashlib.sha256(archive.read(entry)).hexdigest()}
+                for entry in archive.infolist() if not entry.is_dir()}
+
+
+def running_app_version():
+    """Read only local service identity, not installed source text or process lists."""
+    for route, limit in (('/api/identity', 4096), ('/api/state', 262144)):
+        try:
+            with urllib.request.urlopen('http://127.0.0.1:38647' + route, timeout=.7) as response:
+                raw = response.read(limit + 1)
+            if len(raw) > limit: return None
+            state = json.loads(raw)
+            if not isinstance(state, dict): return None
+            version = state.get('build_id', state.get('version'))
+            semver(version)
+            return version
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404: continue  # Older installed app has no identity route.
+            return None
+        except (OSError, ValueError, TypeError, UpdateError): return None
+    return None
+
+
+def plugin_installation_status(plugin_dir, runtime=None):
+    """Read back Loader-owned files; never replace or reload the running plugin."""
+    receipt_path = UPDATES / PLUGIN_RECEIPT
+    if not receipt_path.exists(): return None
+    try:
+        receipt = bounded_json(receipt_path)
+        version = receipt['version']; semver(version)
+        fingerprints = receipt['files']
+        if (receipt.get('format') != 1 or receipt.get('kind') not in ('update', 'rollback')
+                or not isinstance(fingerprints, dict) or not fingerprints
+                or not set(fingerprints).issubset(PLUGIN_FILES)
+                or not (PLUGIN_FILES - {'update_client.py'}).issubset(fingerprints)):
+            raise UpdateError('Invalid plugin installation receipt.')
+        result = {'target_version': version, 'kind': receipt['kind'], 'files_verified': 0,
+                  'app_matches': runtime == version, 'status': 'awaiting-decky',
+                  'message': 'Prepared only. Select DeckPilot Updates → DeckPilot.zip in Decky’s Install from ZIP, then approve.'}
+        root = Path(plugin_dir)
+        if root.is_symlink(): raise UpdateError('Unsafe installed plugin directory.')
+        package = bounded_json(root / 'package.json')
+        if package.get('version') != version: return result
+        for name, expected in fingerprints.items():
+            if (not isinstance(expected, dict) or type(expected.get('size')) is not int
+                    or not 0 <= expected['size'] <= MAX_FILE_BYTES
+                    or not isinstance(expected.get('sha256'), str)
+                    or not re.fullmatch('[a-f0-9]{64}', expected['sha256'])):
+                raise UpdateError('Invalid plugin verification metadata.')
+            source = root / name
+            if any(p.is_symlink() for p in [source, *source.parents] if p != root and root in p.parents):
+                raise UpdateError('Installed plugin has an unsafe link.')
+            with source.open('rb') as handle: raw = handle.read(MAX_FILE_BYTES + 1)
+            if len(raw) != expected['size'] or hashlib.sha256(raw).hexdigest() != expected['sha256']:
+                return {**result, 'status': 'changed', 'message': 'Plugin files do not match the approved package. Reopen Decky installation or restore the previous plugin.'}
+            result['files_verified'] += 1
+        complete = runtime == version
+        return {**result, 'status': 'complete' if complete else 'plugin-verified',
+                'message': 'Done. Running app and installed plugin match '+version+'.' if complete
+                else 'Plugin files verified. The running app does not yet match; check app restart or rollback.'}
+    except (OSError, ValueError, KeyError, TypeError, UpdateError):
+        return {'status': 'unreadable', 'message': 'Cannot verify installed plugin files. Nothing is reported installed; retry the check or use rollback.'}
+
+
+def verify_suite_installation(plugin_dir):
+    """Verify an installation/bootstrap, never install or modify Loader-owned files."""
+    with update_lock(UPDATES):
+        installed = bounded_json(Path(plugin_dir)/'package.json').get('version')
+        receipt = bounded_json(UPDATES / PLUGIN_RECEIPT) if (UPDATES / PLUGIN_RECEIPT).exists() else {}
+        if not receipt or receipt.get('version') != installed:
+            state=suite_proposal();proposal=state['proposal'];version=proposal['manifest']['version']
+            if installed!=version:
+                raise UpdateError('Matching plugin is not installed. Prepare it in Decky first.')
+            asset=proposal['assets']['plugin'];source=Path(proposal['folder'])/asset['name']
+            with source.open('rb') as handle:raw=handle.read(MAX_PLUGIN_BYTES+1)
+            if len(raw)>MAX_PLUGIN_BYTES or hashlib.sha256(raw).hexdigest()!=asset['sha256']:
+                raise UpdateError('Approved plugin package changed. Check for updates again.')
+            with tempfile.TemporaryDirectory(prefix='plugin-verify-',dir=UPDATES) as temp:
+                frozen=Path(temp)/'DeckPilot.zip';frozen.write_bytes(raw)
+                files=plugin_fingerprints(frozen,version)
+            atomic_record(UPDATES/PLUGIN_RECEIPT,{'format':1,'kind':'update','version':version,
+                          'sha256':asset['sha256'],'files':files,'prepared_at':time.time()})
+        result=plugin_installation_status(plugin_dir,running_app_version())
+        return {'ok':result is not None and result.get('status')=='complete',
+                'installation':result,'message':result['message'] if result else 'No approved plugin installation is available to verify.'}
+
+
+def update_diagnostic_summary():
+    """Fixed aggregate update evidence only, never paths, tokens or raw records."""
+    def read(name):
+        try:return bounded_json(UPDATES / name)
+        except (OSError,ValueError,TypeError,UpdateError):return {}
+    work=read('result.json');receipt=read(PLUGIN_RECEIPT)
+    known={'queued','working','success','error','rolled-back','recovered'}
+    target=receipt.get('version')
+    try:semver(target)
+    except UpdateError:target=None
+    status=work.get('status')
+    return {'channel':suite_channel(), 'operation':status if isinstance(status,str) and status in known else 'unknown',
+            'recovery_required':(UPDATES/'transaction.json').is_file(),
+            'app_backup_available':(UPDATES/'previous-app/deckpilot.py').is_file(),
+            'plugin_backup_available':(UPDATES/'plugin-rollback.json').is_file(),
+            'prepared_plugin_version':target,
+            'prepared_is_not_installed':True}
+
+
+def prepare_plugin_file(token, plugin_dir, rollback=False):
+    """Stage verified bytes for Loader's *user-confirmed* local ZIP installer.
+
+    No root, private Decky API, clipboard, HTTP handoff, live-plugin write or
+    automatic installation. The user never downloads/manages the ZIP manually.
+    """
+    with update_lock(UPDATES):
+        if (UPDATES / 'transaction.json').exists() or update_operation_active():
+            raise UpdateError('Finish or recover the app update before preparing a plugin.')
+        if rollback:
+            artifact = bounded_json(UPDATES / 'plugin-rollback.json')
+            source = Path(artifact['path'])
+            if source.is_symlink() or source.parent.resolve() != (UPDATES / 'plugin-backups').resolve():
+                raise UpdateError('Invalid plugin rollback snapshot.')
+        else:
+            state = suite_proposal(token); proposal = state['proposal']; version = proposal['manifest']['version']
+            if current_version() != version or running_app_version() != version:
+                raise UpdateError('Wait for the matching app to restart successfully before preparing its plugin.')
+            asset = proposal['assets']['plugin']; source = Path(proposal['folder']) / asset['name']
+            artifact = {'version': version, 'path': str(source), 'sha256': asset['sha256']}
+        version = artifact['version']; semver(version)
+        if bounded_json(Path(plugin_dir) / 'package.json').get('version') == version:
+            # Avoid overwriting rollback state by snapshotting the target version.
+            raise UpdateError('This plugin version is already installed. Refresh verification instead.')
+        if source.is_symlink(): raise UpdateError('Unsafe plugin package link.')
+        with source.open('rb') as handle: raw = handle.read(MAX_PLUGIN_BYTES + 1)
+        if len(raw) > MAX_PLUGIN_BYTES or hashlib.sha256(raw).hexdigest() != artifact['sha256']:
+            raise UpdateError('Plugin package changed. Check for updates or select a valid rollback.')
+        if shutil.disk_usage(UPDATES).free < len(raw) + 1024 * 1024:
+            raise UpdateError('Not enough free space to prepare the plugin. Existing installation and backups are unchanged.')
+        # Work from an immutable private copy, so the approved bytes and file
+        # hashes cannot come from different archives during a replacement race.
+        with tempfile.TemporaryDirectory(prefix='plugin-pickup-', dir=UPDATES) as temp:
+            frozen = Path(temp) / 'DeckPilot.zip'; frozen.write_bytes(raw)
+            fingerprints = plugin_fingerprints(frozen, version, legacy=rollback)
+        previous = snapshot_plugin(plugin_dir)
+        if previous['version'] == version:raise UpdateError('Plugin changed during preparation. Refresh installed verification.')
+        pickup = PLUGIN_PICKUP
+        if any(p.is_symlink() for p in [pickup, *pickup.parents]):
+            raise UpdateError('The DeckPilot Updates folder has an unsafe link. No plugin files were written.')
+        marker = pickup / '.deckpilot-owned.json'
+        if pickup.exists():
+            if not pickup.is_dir() or not marker.is_file() or marker.is_symlink() or bounded_json(marker) != PICKUP_MARKER:
+                raise UpdateError('DeckPilot Updates is not an application-owned folder. Existing files were preserved.')
+        else:
+            pickup.mkdir(mode=0o700)
+            atomic_record(marker, PICKUP_MARKER)
+        destination = pickup / 'DeckPilot.zip'
+        if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+            raise UpdateError('Unsafe prepared plugin path; existing files were preserved.')
+        if destination.exists() and not (UPDATES / PLUGIN_RECEIPT).is_file():
+            raise UpdateError('An untracked file occupies the prepared ZIP location. Existing files were preserved.')
+        # Reserve space for new bytes without deleting the previous usable ZIP.
+        if shutil.disk_usage(pickup).free < len(raw) + 1024 * 1024:
+            raise UpdateError('Not enough free space to prepare the plugin. Existing installation and backups are unchanged.')
+        pending = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=pickup, prefix='.DeckPilot-', suffix='.zip', delete=False) as handle:
+                pending = Path(handle.name); handle.write(raw); handle.flush(); os.fsync(handle.fileno())
+            if hashlib.sha256(pending.read_bytes()).hexdigest() != artifact['sha256']:
+                raise UpdateError('Prepared plugin readback failed. No installation was requested.')
+            receipt = {'format': 1, 'kind': 'rollback' if rollback else 'update', 'version': version,
+                       'sha256': artifact['sha256'], 'files': fingerprints, 'prepared_at': time.time()}
+            # Persist verification/rollback before exposing the new installable ZIP.
+            atomic_record(UPDATES / 'plugin-rollback.json', previous)
+            atomic_record(UPDATES / PLUGIN_RECEIPT, receipt)
+            pending.replace(destination)
+        finally:
+            if pending is not None: pending.unlink(missing_ok=True)
+        return {'ok': True, 'version': version, 'method': 'decky-install-from-zip',
+                'folder': 'DeckPilot Updates', 'file': 'DeckPilot.zip', 'sha256': artifact['sha256'],
+                'message': 'Ready in Gaming Mode. In Decky Settings → Developer → Install from ZIP, select DeckPilot Updates → DeckPilot.zip and approve. Not installed yet.'}
 
 
 def prepare_plugin_handoff(token,plugin_dir,rollback=False):
@@ -912,7 +1139,7 @@ def serve_plugin(descriptor):
 
 def main():
     parser = argparse.ArgumentParser(description='Install a trusted DeckPilot ZIP and roll back on failure.')
-    parser.add_argument('command', choices=['check', 'install', 'rollback','suite-status','suite-check','suite-channel','suite-install','perform-suite-install','plugin-handoff','plugin-rollback','serve-plugin','suite-rollback','recover-interrupted'])
+    parser.add_argument('command', choices=['check', 'install', 'rollback','suite-status','suite-check','suite-verify','suite-channel','suite-install','perform-suite-install','plugin-handoff','plugin-rollback','plugin-prepare-file','plugin-prepare-rollback','serve-plugin','suite-rollback','recover-interrupted'])
     parser.add_argument('archive', nargs='?')
     parser.add_argument('--sha256')
     parser.add_argument('--plugin-version')
@@ -923,9 +1150,11 @@ def main():
     parser.add_argument('--descriptor')
     args = parser.parse_args()
     try:
-        if args.command.startswith('suite-') or args.command in ('perform-suite-install','plugin-handoff','plugin-rollback','serve-plugin'):
-            if args.command=='suite-status':result=suite_status(args.plugin_version)
-            elif args.command=='suite-check':fetch_suite_update();result=suite_status(args.plugin_version)
+        if args.command.startswith('suite-') or args.command in ('perform-suite-install','plugin-handoff','plugin-rollback','plugin-prepare-file','plugin-prepare-rollback','serve-plugin'):
+            if args.command=='suite-status':result=suite_status(args.plugin_version,args.plugin_dir)
+            elif args.command=='suite-check':fetch_suite_update();result=suite_status(args.plugin_version,args.plugin_dir)
+            elif args.command in ('plugin-prepare-file','plugin-prepare-rollback'):result=prepare_plugin_file(args.token,args.plugin_dir,args.command=='plugin-prepare-rollback')
+            elif args.command=='suite-verify':result=verify_suite_installation(args.plugin_dir)
             elif args.command=='suite-channel':result=set_suite_channel(args.channel)
             elif args.command=='suite-install':result=start_suite_install(args.token,args.allow_downgrade)
             elif args.command=='perform-suite-install':result={'version':perform_suite_install(args.token,args.allow_downgrade)}
@@ -946,7 +1175,7 @@ def main():
         print('Installed:', install_archive(args.archive, expected_sha256=args.sha256))
     except (UpdateError,OSError,ValueError,KeyError,TypeError) as exc:
         if args.command=='perform-suite-install':record('error','Approved update could not finish. Review local update status; recovery remains available.')
-        if args.command.startswith('suite-') or args.command in ('plugin-handoff','plugin-rollback'):
+        if args.command.startswith('suite-') or args.command in ('plugin-handoff','plugin-rollback','plugin-prepare-file','plugin-prepare-rollback'):
             print(json.dumps({'ok':False,'error':str(exc) if isinstance(exc,UpdateError) else 'Update operation unavailable. Current installation is preserved.'}));return
         print(str(exc), file=sys.stderr)
         sys.exit(1)
