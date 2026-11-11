@@ -1,6 +1,6 @@
-# DeckPilot TV v0.8.3-preview.5
+# DeckPilot TV v0.8.3-preview.6
 
-Preview.5 Gaming Mode updates, limitations and controller-only device checks: [preview notes](https://github.com/goddenator/DeckPilot-TV/blob/feature/game-settings-research-v0.8/docs/PREVIEW-5.md).
+Preview.6 ATS effects, running-state evidence and controller-only device checks: [preview notes](https://github.com/goddenator/DeckPilot-TV/blob/feature/game-settings-research-v0.8/docs/PREVIEW-6.md).
 
 Experimental Steam Deck OLED/docked-TV research and cautious settings tool. No paid API or subscription. Community evidence does not guarantee TV performance; the official Valve dock supports up to 4K60 or 1440p120 depending on connection, not guaranteed 4K120.
 

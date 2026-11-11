@@ -2,6 +2,7 @@ import { ButtonItem, PanelSection, PanelSectionRow, TextField, Navigation } from
 import { useEffect, useRef, useState } from 'react';
 import { launchController } from './launch';
 import { Updates } from './Updates';
+import { observeSteam } from './steamEvidence';
 import { LaunchView } from './LaunchView';
 import type { ReactNode } from 'react';
 import { api, Checkup, Game, Mode, Preview, Profile, Research, Result, State } from './api';
@@ -40,8 +41,9 @@ export function DeckPilotApp(){
   const [busy,setBusy]=useState(false);
   const [message,setMessage]=useState('');
   const [offline,setOffline]=useState(false);
-  const [confirm,setConfirm]=useState<'install'|'rollback'|'drive'|'play'|undefined>();
+  const [confirm,setConfirm]=useState<'install'|'rollback'|'drive'|'play'|'evidence'|undefined>();
   const [technical,setTechnical]=useState(false);
+  const [lastEvidence,setLastEvidence]=useState<{appid:string;proc_state:string;proc_reason:string;steam_ui:{status:string;listed_running?:boolean;display_status?:number}}>();
   const inFlight=useRef(false);
   const context=info.context||'docked';
   const modern=info.schema_version===2 && (!info.update_suite || (info.update_suite.compatible===true&&!info.update_suite.recovery_required));
@@ -75,7 +77,7 @@ export function DeckPilotApp(){
   };
   const navigate=(next:Screen)=>{if(!launchController.cancel())return;setScreen(next);setDetail('main');setReview(undefined);setConfirm(undefined);setTechnical(false);setMessage('');};
   const selectGame=(g:Game)=>{
-    setSelected(g);setResearch(undefined);setReview(undefined);setCheckup(undefined);navigate('game');
+    setSelected(g);setLastEvidence(undefined);setResearch(undefined);setReview(undefined);setCheckup(undefined);navigate('game');
     void run(async()=>{const c=await api.checkup(g.appid,context);setCheckup(c);return c;});
   };
   const refreshGame=async()=>{if(game){const c=await api.checkup(game.appid,context);setCheckup(c);return c;}return {};};
@@ -196,9 +198,16 @@ export function DeckPilotApp(){
         {row(<p className="dp-small">Game state: {checkup?.process?.state||'not checked'} · {checkup?.process?.reason||'Refresh Checkup for evidence'}</p>)}
         {checkup?.process?.message&&row(<p className="dp-small">{checkup.process.message}{checkup.process.state==='uncertain'?' Settings changes are blocked. Use Steam Play/Resume.':''}</p>)}
         {checkup?.process?.counts&&row(<div className="dp-small">{Object.entries(checkup.process.counts).map(([reason,count])=><p key={reason}>{reason}: {count}</p>)}</div>)}
-        {checkup?.coverage&&row(<div className="dp-small">{checkup.coverage.message}{checkup.coverage.probes?.map(p=><p key={p.kind}>{p.kind}: {p.status} · {p.known_keys} known setting keys. Read-only.</p>)}</div>)}
+        {checkup?.coverage&&row(<div className="dp-small">{checkup.coverage.message}{checkup.coverage.native_checks&&Object.entries(checkup.coverage.native_checks).map(([key,value])=><p key={key}>{key}: {value?'yes':'not confirmed'}</p>)}{checkup.coverage.probes?.map(p=><p key={p.kind}>{p.kind}: {p.status} · {p.known_keys} known setting keys. Read-only.</p>)}</div>)}
         {checkup?.can_restore&&bigButton('Restore game settings',()=>{setScreen('game');setDetail('restore');})}
         {bigButton('Refresh Game Checkup',()=>void run(refreshGame))}
+        {lastEvidence?.appid===game.appid&&row(<p className="dp-small">Recorded process: {lastEvidence.proc_state} · {lastEvidence.proc_reason}. Steam UI: {lastEvidence.steam_ui.status}; selected game {lastEvidence.steam_ui.listed_running===true?'listed as running':lastEvidence.steam_ui.listed_running===false?'not listed as running':'running list unknown'}. Diagnostic observation only — does not confirm closure.</p>)}
+        {confirm==='evidence'?<>
+          {row(<p>What does Steam show for this game? This records observations only; it never authorises changes or launches a game.</p>)}
+          {([['steam-play','Steam shows Play'],['steam-stop','Steam shows Stop or Resume'],['unsure','Not sure']] as const).map(([reference,label])=>bigButton(label,()=>void run(async()=>{setConfirm(undefined);const r=await api.recordEvidence(game.appid,reference,observeSteam(game.appid));setLastEvidence(r.evidence);return r;})))}
+          {bigButton('Cancel evidence recording',()=>setConfirm(undefined))}
+        </>:bigButton('Record game evidence',()=>setConfirm('evidence'),'Saves a local report for this selected game. No game settings change.',offline||!modern)}
+
       </PanelSection>}
       <PanelSection title="Play-time recommendations">
         {info.launch_prompt?.protocol===2?<>
@@ -228,7 +237,7 @@ export function DeckPilotApp(){
       </PanelSection>
       <PanelSection title="Display & App">
         {row(<p className="dp-small">VRR capability: {info.display?.vrr_capability||'unknown'}. VRR enabled: {info.display?.vrr_enabled||'unknown'}. {info.display?.note}</p>)}
-        {row(<p className="dp-small">App {info.build_id||info.version||'unknown'} · Plugin {info.plugin_version||'0.8.3-preview.5'}. {info.update?.github?.message}</p>)}
+        {row(<p className="dp-small">App {info.build_id||info.version||'unknown'} · Plugin {info.plugin_version||'0.8.3-preview.6'}. {info.update?.github?.message}</p>)}
         {bigButton('Refresh status',()=>void run(async()=>{await refresh();return {message:'Refreshed.'};}))}
       </PanelSection>
     </>}

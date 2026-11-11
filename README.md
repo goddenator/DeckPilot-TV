@@ -1,6 +1,6 @@
-# DeckPilot TV — v0.8.3-preview.5 development
+# DeckPilot TV — v0.8.3-preview.6 development
 
-Stage 1: [Gaming Mode updates, limitations and device checklist](docs/PREVIEW-5.md). [Full implementation programme](docs/IMPLEMENTATION-PLAN.md). Published preview.4 remains unchanged.
+Preview.6: [native ATS effects, running-state evidence and Gaming Mode checklist](docs/PREVIEW-6.md). [Preview.5 updater](docs/PREVIEW-5.md) and [full programme](docs/IMPLEMENTATION-PLAN.md). Published versions remain unchanged.
 
 A free, cautious Steam Deck OLED optimisation assistant with three choices: **Best Graphics**, **Best Performance**, and **Balanced**. This is an unreleased development build on PR #3; nothing is merged or published.
 
@@ -11,7 +11,7 @@ The Decky interface has four simple screens:
 - **Game Details** — Game Checkup, three choices, review/approve local changes, and short community advice. Sources are optional.
 - **Settings** — select a separate Docked/Handheld profile and review updates. Restore, measurements and private diagnostics live under **Advanced**.
 
-Profiles are selected manually. Switching profiles never edits files. A concrete preview and approval are required before a compatible local adapter can apply settings, with backups first and newer user changes protected. Native Valheim and Hollow Knight support is limited to existing XML resolution settings; other unknown formats remain advisory. Saves and Steam launch options are untouched.
+Profiles are selected manually. Switching profiles never edits files. A concrete preview and approval are required before a compatible local adapter can apply settings, with backups first and newer user changes protected. Native Valheim and Hollow Knight support is limited to existing XML resolution settings; other unknown formats remain advisory. Native ATS has conditional partial support for documented vegetation/cloud-shadow/sunshaft settings; resolution/scaling stay unchanged. The actual SteamOS running-state blocker remains unresolved, so uncertain games cannot be modified. Saves and Steam launch options are untouched.
 
 Independent Deck Settings / deckverified.games, ShareDeck and SteamDeckHQ reports retain provenance, evidence confidence, and offline cache labels. Balanced is a conservative starting recommendation, not a promise of optimal or achieved performance. Optional analysis reads existing attributable FPS/frame-time logs only; it does not start a recorder or automatically learn/apply settings.
 

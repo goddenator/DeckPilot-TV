@@ -2,7 +2,7 @@
 """DeckPilot TV 0.8: cautious Steam Deck game preset synchronizer.
 
 Only edits allowlisted existing Unreal Engine config files in Steam Proton
-prefixes and native Valheim resolution preferences after preview approval. Does not touch Steam client settings or display mode.
+prefixes, native Unity resolution preferences and documented native ATS effects after preview approval. Does not touch Steam client settings or display mode.
 """
 from __future__ import annotations
 import argparse
@@ -16,6 +16,7 @@ import zipfile
 import urllib.request
 import urllib.error
 import statistics
+import stat
 import datetime as dt
 import hashlib
 import html
@@ -34,7 +35,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 VERSION = '0.8.3'
-BUILD_ID = '0.8.3-preview.5'
+BUILD_ID = '0.8.3-preview.6'
 APP = 'deckpilot-tv'
 PORT = 38647
 MODES = {'graphics', 'performance', 'balanced'}
@@ -708,22 +709,127 @@ def transform_valheim(raw, mode, context=None):
     return raw
 
 
+# Official SCS variables reference oldid=5727: g_veg_detail explicitly 0/1/2;
+# r_cloud_shadows and r_sunshafts are boolean integer effect switches.
+# Deliberately do not edit undocumented r_mode_width/height or guess scale ranges.
+ATS_KEYS = ('g_veg_detail', 'r_cloud_shadows', 'r_sunshafts')
+ATS_PRESETS = {'graphics': ('2','1','1'), 'balanced': ('1','0','1'), 'performance': ('0','0','0')}
+
+
+def ats_values(raw):
+    if len(raw.encode('utf-8')) > 2_000_000 or '\x00' in raw or raw.startswith('\ufeff'):
+        raise ValueError('Unsupported ATS encoding or size.')
+    if not raw.splitlines() or raw.splitlines()[0].strip() != '# prism3d variable config data':
+        raise ValueError('ATS configuration signature is missing.')
+    found = {}
+    for line in raw.splitlines():
+        head = re.match(r'^\s*uset\s+(\w+)\b', line,re.I)
+        if not head or head[1].lower() not in (*ATS_KEYS, 'r_device'): continue
+        if head[1]!=head[1].lower() or not re.match(r'^\s*uset\s+',line):raise ValueError('Noncanonical ATS key casing.')
+        match = re.fullmatch(r'\s*uset\s+(\w+)\s+"([^"\r\n]*)"\s*(?:#.*)?', line)
+        if not match or head[1] in found: raise ValueError('Ambiguous ATS graphics key.')
+        found[head[1]] = match[2]
+    if found.get('r_device') != 'gl': raise ValueError('Only the verified native OpenGL layout is supported.')
+    for key in ATS_KEYS:
+        if found.get(key) not in (('0','1','2') if key == 'g_veg_detail' else ('0','1')):
+            raise ValueError('Missing or unsupported ATS graphics value.')
+    return {k:found[k] for k in ATS_KEYS}
+
+
+def transform_ats(raw, mode):
+    ats_values(raw)
+    values = dict(zip(ATS_KEYS, ATS_PRESETS[mode]))
+    pattern = r'(?m)^(\s*uset\s+)('+'|'.join(ATS_KEYS)+r')(\s+")[^"\r\n]*(")'
+    return re.sub(pattern, lambda m:m[1]+m[2]+m[3]+values[m[2]]+m[4], raw)
+
+
+def ats_native_evidence(game, home=None):
+    """Existing native depot + exact manifest/config proof, not a title guess."""
+    result={'manifest':False,'native_binary':False,'windows_binary':False,'config_present':False,'signature':False,'open_gl':False,'graphics_keys':False,'schema':False}
+    if game['appid'] != '270880':return result,None
+    library=Path(game['library']);manifest=library/'appmanifest_270880.acf'
+    try:
+        if any(p.is_symlink() for p in [manifest,*manifest.parents]):return result,None
+        with manifest.open('rb') as handle:body=handle.read(262145)
+        if len(body)>262144:return result,None
+        body=body.decode('utf-8-sig')
+        directory=parse_vdf_key(body,'installdir')
+        if parse_vdf_key(body,'appid')!='270880' or len(re.findall(r'(?im)^\s*"appid"\s+"',body))!=1 or len(re.findall(r'(?im)^\s*"installdir"\s+"',body))!=1 or not directory or len(directory)>120 or any(ord(c)<32 for c in directory) or directory in ('.','..') or '/' in directory or '\\' in directory:return result,None
+        if parse_vdf_key(body,'platform_override_dest') not in (None,'','linux'):return result,None
+        result['manifest']=True
+        install=library/'common'/directory
+        native=install/'bin/linux_x64/amtrucks';windows=install/'bin/win_x64/amtrucks.exe'
+        try:
+            windows.lstat()
+            result['windows_binary']=True  # A symlink is not proof of absence either.
+        except FileNotFoundError:pass
+        if not native.is_file() or any(p.is_symlink() for p in [native,*native.parents]):return result,None
+        with native.open('rb') as handle:result['native_binary']=handle.read(4)==b'\x7fELF'
+        path=(Path(home) if home is not None else Path.home())/'.local/share/American Truck Simulator/config.cfg'
+        if not path.is_file() or any(p.is_symlink() for p in [path,*path.parents]):return result,None
+        with path.open('rb') as handle:data=handle.read(2_000_001)
+        result['config_present']=True
+        raw=data.decode('utf-8')
+        result['signature']=bool(raw.splitlines() and raw.splitlines()[0].strip()=='# prism3d variable config data')
+        result['open_gl']=re.findall(r'(?m)^\s*uset\s+r_device\s+"([^"\r\n]*)"\s*$',raw)==['gl']
+        result['graphics_keys']=all(len(values:=re.findall(r'(?m)^\s*uset\s+'+key+r'\s+"([^"\r\n]*)"\s*(?:#.*)?$',raw))==1 and values[0] in (('0','1','2') if key=='g_veg_detail' else ('0','1')) for key in ATS_KEYS)
+        ats_values(raw);result['schema']=True
+        if result['native_binary'] and not result['windows_binary']:return result,path
+    except (OSError,ValueError,UnicodeError):pass
+    return result,None
+
+
 def adapter_files(game):
+    if game['appid']=='270880':
+        _,path=ats_native_evidence(game)
+        return [(path,'ats-native-effects-v1')] if path else []
     # Existing UE handling remains an explicit compatible-format adapter.
     return [(p, 'unreal') for p in find_ue_configs(game)] + [(p, 'valheim-native' if game['appid'] == '892970' else 'hollow-knight-native') for p in find_valheim_configs(game)]
 
 
-def settings_coverage(game, home=None):
+def ffx_config_probes(game):
+    # Steam Store verifies 359870 as the Windows-only X/X-2 remaster. These are
+    # read-only candidate locations, not a claimed or writable settings schema.
+    if game['appid']!='359870':return []
+    library=Path(game['library']);manifest=library/'appmanifest_359870.acf'
+    candidates=[('proton-launcher',library/'compatdata/359870/pfx/drive_c/users/steamuser/Documents/SQUARE ENIX/FINAL FANTASY X&X-2 HD Remaster/FFX&X-2_LAUNCHER.ini')]
+    try:
+        if not any(p.is_symlink() for p in [manifest,*manifest.parents]):
+            with manifest.open('rb') as handle:raw=handle.read(262145)
+            body=raw.decode('utf-8-sig');directory=parse_vdf_key(body,'installdir')
+            if len(raw)<=262144 and parse_vdf_key(body,'appid')=='359870' and directory and directory not in ('.','..') and not any(c in directory for c in ('/','\\')):
+                candidates.append(('install-launcher',library/'common'/directory/'FFX&X-2_LAUNCHER.ini'))
+    except (OSError,ValueError,UnicodeError):pass
+    result=[]
+    for kind,path in candidates:
+        probe={'kind':kind,'status':'absent','known_keys':0,'format':'unknown'}
+        try:
+            if any(p.is_symlink() for p in [path,*path.parents]):probe['status']='unsafe-path'
+            elif not stat.S_ISREG(path.stat().st_mode):probe['status']='unsafe-path'
+            else:
+                with path.open('rb') as handle:raw=handle.read(65537)
+                if len(raw)>65536:probe['status']='oversized'
+                elif b'\0' in raw:probe.update(status='candidate',format='binary-or-utf16')
+                else:
+                    text=raw.decode('utf-8-sig')
+                    probe.update(status='candidate',format='ini-like' if re.search(r'(?m)^\s*\[[^\r\n\]]+\]',text) else 'text-unknown')
+        except FileNotFoundError:pass
+        except (OSError,UnicodeError):probe['status']='unreadable'
+        result.append(probe)
+    return result
+
+
+def settings_coverage(game, home=None, files=None):
     """Read-only adapter research. No candidate contents or private paths exported.
 
     ATS identity is confirmed in issue #6. FFX identity is read from this device's
     installed manifest, never assigned from a title guess. Candidates do not grant
     write support. Their actual formats still need device evidence and review.
     """
-    files = adapter_files(game)
+    files = adapter_files(game) if files is None else files
     result = {'appid': game['appid'], 'supported_files': len(files),
               'adapters': sorted({a for _, a in files}), 'writable': bool(files)}
-    if files: return {**result, 'message': 'Existing compatible settings found. Review exact keys before applying.'}
+    if files: return {**result, 'partial': any(a=='ats-native-effects-v1' for _,a in files), 'message': 'Partial native ATS support: vegetation and two effects only; resolution, scaling and measured FPS unchanged.' if any(a=='ats-native-effects-v1' for _,a in files) else 'Existing compatible settings found. Review exact keys before applying.'}
     if game['appid'] == '270880':
         base = Path(home) if home is not None else Path.home()
         candidates = [base / '.local/share/American Truck Simulator/config.cfg',
@@ -741,13 +847,17 @@ def settings_coverage(game, home=None):
                     probe.update(status='candidate', known_keys=sum(found.count(k) == 1 for k in keys))
             except (OSError, ValueError, UnicodeError): probe['status'] = 'unreadable'
             probes.append(probe)
-        return {**result, 'probes': probes, 'message': 'ATS is advice only. Candidate checks are read-only; no approved ATS adapter yet.'}
-    if re.search(r'final\s+fantasy\s+x(?:\b|/)', game.get('name', ''), re.I):
-        return {**result, 'message': 'Final Fantasy X is advice only. Installed App ID recorded; configuration format needs device verification.'}
+        return {**result, 'probes': probes, 'native_checks':ats_native_evidence(game, home)[0], 'message': 'Advice only — no game settings changed. Native depot, OpenGL and documented-key checks are required for ATS.'}
+    if game['appid']=='359870' or re.search(r'final\s+fantasy\s+x(?:\b|/)', game.get('name', ''), re.I):
+        return {**result, **({'probes':ffx_config_probes(game),'store_appid_match':True} if game['appid']=='359870' else {'store_appid_match':False}), 'message': 'Advice only — no game settings changed. Installed manifest App ID recorded; FFX configuration candidates are read-only and need device verification.'}
     return {**result, 'message': 'Advice only. No supported settings file.'}
 
 
 def transform_adapter(path, raw, mode, adapter, context=None):
+    if adapter == 'ats-native-effects-v1':
+        with path.open('rb') as handle:
+            if handle.read(3)==b'\xef\xbb\xbf':raise ValueError('ATS BOM encoding is not supported.')
+        return transform_ats(raw,mode)
     if adapter == 'unreal': return transform_ue_ini(raw, mode, context)
     if adapter in ('valheim-native', 'hollow-knight-native'): return transform_valheim(raw, mode, context)
     raise ValueError('No allowlisted adapter.')
@@ -806,6 +916,8 @@ def preview_profile(appid, mode, context=None):
                             if key and key.startswith('sg.')==(head[1].casefold()=='scalabilitygroups'):result[key]=m[2]
                     return result
                 before, after = values(raw), values(changed)
+            elif adapter=='ats-native-effects-v1':
+                before,after=ats_values(raw),ats_values(changed)
             else:
                 import xml.etree.ElementTree as ET
                 def values(text):
@@ -819,8 +931,9 @@ def preview_profile(appid, mode, context=None):
     if not files: return {'ok': True, 'status': 'unsupported', 'files': [], 'message': 'No compatible local adapter. Research and mode preference are advisory only.'}
     token = sha(json.dumps([appid, mode, context, fingerprints], sort_keys=True))
     preset = (HANDHELD_PRESETS if context == 'handheld' else PRESETS)[mode]
-    summary = {'resolution': str(preset['x'])+' × '+str(preset['y']),
-               'quality': {1:'Low',2:'Medium',3:'High'}[preset['quality']] if any(f['adapter']=='unreal' for f in files) else None,
+    ats_only=all(f['adapter']=='ats-native-effects-v1' for f in files)
+    summary = {'resolution': 'Display resolution unchanged' if ats_only else str(preset['x'])+' × '+str(preset['y']),
+               'quality': ({'graphics':'High','balanced':'Medium','performance':'Low'}[mode]+' vegetation/effects only') if ats_only else ({1:'Low',2:'Medium',3:'High'}[preset['quality']] if any(f['adapter']=='unreal' for f in files) else None),
                'files': len(files), 'manual_files': sum(f['manual_changes'] for f in files)}
     return {'ok': True, 'status': 'preview', 'appid': appid, 'mode': mode, 'context': context, 'files': files, 'summary': summary, 'fingerprints': {p[0]:p[1] for p in fingerprints}, 'paths': [p[0] for p in fingerprints], 'token': token,
             'message': 'Conservative local starting points, not downloaded report instructions or measured optimal settings. Manual/game edits will be skipped. Backups precede every first edit.'}
@@ -866,7 +979,7 @@ def game_checkup(appid, context=None):
     if not game: return {**result, 'message': 'Saved for when you install it.'}
     files = adapter_files(game)
     result['supported_files'] = len(files)
-    result['coverage'] = settings_coverage(game)
+    result['coverage'] = settings_coverage(game, files=files)
     result['process']=game_running_state(appid)
     if not files: return {**result, 'status': 'advisory', 'message': 'Advice only. No supported settings file.'}
     visibility=result['process']
@@ -903,6 +1016,7 @@ def game_checkup(appid, context=None):
     elif result['optimised']: status, message = 'ready', 'Your approved settings match.'
     elif matches: status, message = 'settings-match', 'Settings match. Review to enable safe sync.'
     else: status, message = 'needs-review', 'Ready to review settings.'
+    if result['coverage'].get('partial'):message+=' Partial ATS support: vegetation/effects only; display resolution and scaling are unchanged.'
     return {**result, 'status': status, 'message': message}
 
 
@@ -1116,6 +1230,8 @@ def safe_read_text(path):
         data = handle.read(2_000_001)
     if b'\x00' in data or len(data) > 2_000_000:
         raise ValueError('unsupported encoding or size')
+    if path.name=='config.cfg' and path.parent.name=='American Truck Simulator' and data.startswith(b'\xef\xbb\xbf'):
+        raise ValueError('Unsupported ATS BOM encoding; preserve this file unchanged.')
     return data.decode('utf-8-sig')
 
 
@@ -1165,17 +1281,108 @@ def parse_process_stat(raw):
     return raw[begin + 1:end].decode('utf-8', errors='surrogateescape'), fields[0].decode(), start, flags
 
 
-def game_running_state(appid, proc=None):
+EVIDENCE_REFERENCES = {'steam-play', 'steam-stop', 'unsure'}
+VISIBILITY_KEYS = {'target_scope','other_game_scope','no_game_scope','cgroup_unreadable','same_credentials','mixed_credentials','status_unreadable','traced','not_traced'}
+
+
+def denied_process_visibility(item, appid, counts):
+    """Read permitted kernel metadata only. Never a closed-state authority."""
+    def add(key):counts[key]=counts.get(key,0)+1
+    try:
+        with (item/'status').open('rb') as handle:raw=handle.read(65537)
+        if len(raw)>65536:raise ValueError()
+        uid=re.search(rb'^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$',raw,re.M)
+        if not uid:raise ValueError()
+        add('same_credentials' if all(int(v)==os.getuid() for v in uid.groups()) else 'mixed_credentials')
+        tracer=re.search(rb'^TracerPid:\s+(\d+)',raw,re.M)
+        if tracer:add('traced' if int(tracer[1]) else 'not_traced')
+    except (OSError,ValueError):add('status_unreadable')
+    try:
+        with (item/'cgroup').open('rb') as handle:raw=handle.read(16385)
+        if len(raw)>16384:raise ValueError()
+        ids=re.findall(rb'(?:^|/)app-steam-([0-9]+)(?:-[^/\r\n]+)?\.(?:scope|service)(?:/|$)',raw,re.M)
+        add('target_scope' if appid.encode() in ids else 'other_game_scope' if ids else 'no_game_scope')
+    except (OSError,ValueError):add('cgroup_unreadable')
+
+
+def sanitize_steam_observation(value, appid):
+    if not isinstance(value,dict) or value.get('appid')!=appid:raise ValueError('Steam observation does not match the selected game.')
+    allowed={'available','missing','error','uninitialized','id-mismatch','limited'}
+    result={'appid':appid,'status':value.get('status') if value.get('status') in allowed else 'error'}
+    for key in ('initialized','overview_match','listed_running','local_installed'):
+        if type(value.get(key)) is bool:result[key]=value[key]
+    status=value.get('display_status')
+    if type(status) is int and 0<=status<=40:result['display_status']=status
+    result['diagnostic_only']=True
+    return result
+
+
+def sanitize_evidence(value):
+    if not isinstance(value,dict):raise ValueError('Invalid diagnostic record.')
+    appid=steam_id(value.get('appid'));reference=value.get('reference')
+    if reference not in EVIDENCE_REFERENCES:raise ValueError('Invalid Steam reference.')
+    stamp=value.get('recorded_at','')
+    if not isinstance(stamp,str) or len(stamp)>40 or not re.fullmatch(r'\d{4}-\d\d-\d\dT[0-9:.]+\+00:00',stamp):raise ValueError('Invalid diagnostic time.')
+    states={'running','closed','uncertain'};reasons=set(PROCESS_PROBE_MESSAGES)|{'no-app-process','exact-app-process'}
+    if value.get('proc_state') not in states or value.get('proc_reason') not in reasons:raise ValueError('Invalid process evidence.')
+    result={k:value[k] for k in ('appid','reference','recorded_at','proc_state','proc_reason')}
+    for key,allowed in (('counts',set(PROCESS_PROBE_MESSAGES)|{'exited','kernel-thread','unrelated-helper','pid-exited'}),('visibility',VISIBILITY_KEYS)):
+        raw=value.get(key,{})
+        if not isinstance(raw,dict):raise ValueError('Invalid diagnostic counters.')
+        result[key]={k:v for k,v in raw.items() if k in allowed and type(v) is int and 0<=v<=4097}
+    result['steam_ui']=sanitize_steam_observation(value.get('steam_ui'),appid)
+    result['ats_checks']={k:v for k,v in value.get('ats_checks',{}).items() if k in ('manifest','native_binary','windows_binary','config_present','signature','open_gl','graphics_keys','schema') and type(v) is bool}
+    result['ats_values']={k:v for k,v in value.get('ats_values',{}).items() if k in ATS_KEYS and v in ('0','1','2')}
+    return result
+
+
+def evidence_history():
+    path=BASE/'game-evidence.json'
+    if not path.exists():return []
+    try:
+        with path.open('rb') as handle:raw=handle.read(65537)
+        if len(raw)>65536:raise ValueError()
+        values=json.loads(raw)
+        if not isinstance(values,list) or len(values)>12:raise ValueError()
+        return [sanitize_evidence(v) for v in values]
+    except (OSError,ValueError,TypeError,KeyError,AttributeError):return []
+
+
+@game_transaction
+def record_game_evidence(appid, reference, observation):
+    appid=steam_id(appid)
+    if reference not in EVIDENCE_REFERENCES:raise ValueError('Choose what Steam currently shows.')
+    native=sanitize_steam_observation(observation,appid)
+    game=next((g for g in installed_games() if g['appid']==appid),None)
+    if not game:raise ValueError('Select an installed game before recording evidence.')
+    process=game_running_state(appid,diagnostics=True)
+    checks,path=ats_native_evidence(game)
+    values=ats_values(safe_read_text(path)) if path else {}
+    record=sanitize_evidence({'appid':appid,'reference':reference,'recorded_at':dt.datetime.now(dt.timezone.utc).isoformat(),
+            'proc_state':process['state'],'proc_reason':process['reason'],'counts':process.get('counts',{}),
+            'visibility':process.get('visibility',{}),'steam_ui':native,'ats_checks':checks,'ats_values':values})
+    history=evidence_history();history.append(record);history=history[-12:]
+    atomic_json(BASE/'game-evidence.json',history)
+    # One selected-game scan only, reused in this manual export. No second scan
+    # of the first eight games while the user is trying to record a transition.
+    report=diagnostic_report(include_process=True,focus=appid,process_snapshot=process)
+    save_diagnostic_zip(report)
+    return {'ok':True,'message':'Game evidence and local diagnostic ZIP saved. No game settings changed. Repeat while running and after exiting; review the report before sharing.',
+            'evidence':record,'records':len(history)}
+
+
+def game_running_state(appid, proc=None, diagnostics=False):
     """Bounded, read-only evidence. Unknown never grants permission to write."""
     appid = steam_id(appid); proc = Path(proc) if proc is not None else PROC_ROOT
     deadline = time.monotonic() + 0.5
-    uncertain = set(); counts = {}; scanned = 0
+    uncertain = set(); counts = {}; visibility = {}; scanned = 0
 
     def count(category): counts[category] = counts.get(category, 0) + 1
     def block(category): count(category); uncertain.add(category)
     def result(state, reason):
         return {'appid': appid, 'state': state, 'source': 'proc', 'reason': reason,
                 'scanned': scanned, 'counts': dict(sorted(counts.items())),
+                **({'visibility':visibility} if diagnostics else {}),
                 'message': PROCESS_PROBE_MESSAGES.get(reason, 'Exact game process found.' if state == 'running' else 'No game process found in the completed check.')}
     def identity(item):
         with (item / 'stat').open('rb') as handle: raw = handle.read(16385)
@@ -1260,7 +1467,9 @@ def game_running_state(appid, proc=None):
                     except FileNotFoundError: count('pid-exited')
                     except (OSError, ValueError): block('stat-read')
                     else: block('attribute-missing')
-                except PermissionError: block(stage + '-permission')
+                except PermissionError:
+                    block(stage + '-permission')
+                    if diagnostics:denied_process_visibility(item,appid,visibility)
                 except ValueError: block('stat-format' if stage == 'stat' else stage + '-read')
                 except OSError: block(stage + '-read')
     except OSError:
@@ -1596,11 +1805,12 @@ def redact_diagnostic(text):
     return text[:500]
 
 
-def diagnostic_report(include_process=False):
+def diagnostic_report(include_process=False, focus=None, process_snapshot=None):
     """Aggregate technical indicators only; no raw config, library paths or keys."""
     games = installed_games()
     cfg = config()
-    file_count = sum(bool(adapter_files(g)) for g in games)
+    adapters = {g['appid']: adapter_files(g) for g in games}
+    file_count = sum(bool(files) for files in adapters.values())
     state = read_json(STATE, {})
     try:
         with LOG.open('rb') as handle:
@@ -1616,8 +1826,8 @@ def diagnostic_report(include_process=False):
     except OSError:
         os_name = 'Linux'
     return {
-        **({'process_checks':[game_running_state(g['appid']) for g in games[:8]],
-            'settings_coverage':[settings_coverage(g) for g in games[:100]]} if include_process else {}),
+        **({'process_checks':[process_snapshot] if process_snapshot is not None else [game_running_state(g['appid']) for g in games if g['appid']==focus] if focus else [game_running_state(g['appid']) for g in games[:8]],
+            'settings_coverage':[settings_coverage(g,files=adapters[g['appid']]) for g in games[:100] if not focus or g['appid']==focus], 'game_evidence':evidence_history()} if include_process else {}),
         'format': 1, 'app': 'DeckPilot TV', 'version': VERSION, 'build_id': BUILD_ID,
         'updates': updater.update_diagnostic_summary(),
         'created_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -1630,7 +1840,7 @@ def diagnostic_report(include_process=False):
         'external_vrr_advertised': external_vrr_capability(),
         'display': display_diagnostics(),
         'unsupported_games': len(games) - file_count,
-        'adapter_counts': {name: sum(any(a == name for _, a in adapter_files(g)) for g in games) for name in ('unreal', 'valheim-native', 'hollow-knight-native')},
+        'adapter_counts': {name: sum(any(a == name for _, a in files) for files in adapters.values()) for name in ('unreal', 'valheim-native', 'hollow-knight-native', 'ats-native-effects-v1')},
         'log_lines': lines, 'errors': [l for l in lines if re.search(r'(?i)\b(error|exception|traceback|failed)\b', l)][-40:],
         'notes': ['Google Drive upload is optional and requires enabling it in DeckPilot.', 'Log redaction is best-effort; review before sharing.',
                   'VRR capability is not proof VRR is active.', 'No raw game configuration files are included.']
@@ -1650,12 +1860,18 @@ def make_diagnostic_zip(report=None):
     return out.getvalue()
 
 
-def save_diagnostic_zip():
+def save_diagnostic_zip(report=None):
     REPORTS.mkdir(parents=True, exist_ok=True,mode=0o700)
     name = 'DeckPilot-Latest-Local.zip'  # replace instead of accumulating ZIP files
     dest = REPORTS / name
-    dest.write_bytes(make_diagnostic_zip())
-    os.chmod(dest, 0o600)
+    if dest.is_symlink():raise ValueError('Diagnostic report path is a symlink; existing files preserved.')
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=REPORTS,prefix='.diagnostics-',suffix='.zip',delete=False) as handle:
+            temp=Path(handle.name);handle.write(make_diagnostic_zip(report));handle.flush();os.fsync(handle.fileno())
+        temp.replace(dest)
+    finally:
+        if temp is not None:temp.unlink(missing_ok=True)
     return dest
 
 
@@ -1767,7 +1983,9 @@ def upload_cloud_report(force=False, report=None):
         cfg['last_status'] = reason
         cloud_state_update(last_status=cfg['last_status'])
         return reason
-    report = report if report is not None else diagnostic_report(include_process=True)
+    report = report if report is not None else diagnostic_report(include_process=force)
+    if not force:
+        report = {k:v for k,v in report.items() if k not in ('process_checks','settings_coverage','game_evidence')}
     fingerprint = cloud_fingerprint(report)
     error_fingerprint = sha(json.dumps(report.get('errors', []), sort_keys=True))
     now = time.time()
@@ -1860,7 +2078,7 @@ def state_for_ui():
         result.append({'appid': g['appid'], 'name': g['name'], 'mode': mode,
                        'adapter': ', '.join(sorted({a for _, a in adapters})) if has_adapter else 'Advisory only',
                        'approved': cfg['approved'].get(g['appid']) == mode and cfg['approved_context'].get(g['appid']) == cfg['context'],
-                       'supported': has_adapter, 'metrics': metrics, 'hint': mode_hint(mode, metrics)})
+                       'supported': has_adapter, 'metrics': metrics, 'hint': 'ATS vegetation/effects only; resolution/scaling unchanged. Performance not measured.' if any(a=='ats-native-effects-v1' for _,a in adapters) else mode_hint(mode, metrics)})
     return {'version': VERSION, 'build_id': BUILD_ID, 'schema_version': 2, 'context': cfg['context'], 'profiles': cfg['profiles'],
             'measurements_enabled': cfg['measurements_enabled'],
             'launch_prompt': {'protocol': 2, 'enabled': cfg['play_assistant_enabled'], 'available': True, 'native_play': False, 'method': 'deckpilot-button', 'dismissed': cfg['launch_dismissed'], 'reason': 'Opt-in DeckPilot Play button only. Native Steam Play is untouched.'},
@@ -2076,13 +2294,21 @@ def run_server():
 
 def main():
     parser = argparse.ArgumentParser(description='DeckPilot TV: Steam Deck OLED docked game optimiser')
-    parser.add_argument('command', choices=['serve', 'scan', 'apply', 'restore', 'status', 'diagnose', 'export', 'cloud-status', 'cloud-upload', 'cloud-enable', 'cloud-disable', 'update-status', 'set-mode', 'plugin-state', 'check-github', 'install-update', 'rollback-update', 'search', 'research', 'preview', 'approve', 'set-context', 'checkup', 'measurements-enable', 'measurements-disable', 'play-enable', 'play-disable', 'play-plan', 'play-preview', 'play-approve', 'play-dismiss', 'play-reset','process-status'])
+    parser.add_argument('command', choices=['serve', 'scan', 'apply', 'restore', 'status', 'diagnose', 'export', 'cloud-status', 'cloud-upload', 'cloud-enable', 'cloud-disable', 'update-status', 'set-mode', 'plugin-state', 'check-github', 'install-update', 'rollback-update', 'search', 'research', 'preview', 'approve', 'set-context', 'checkup', 'measurements-enable', 'measurements-disable', 'play-enable', 'play-disable', 'play-plan', 'play-preview', 'play-approve', 'play-dismiss', 'play-reset','process-status','record-game-evidence'])
     parser.add_argument('appid', nargs='?')
     parser.add_argument('--mode', choices=sorted(MODES))
     parser.add_argument('--preview-token', default='')
     parser.add_argument('--launch-protocol',type=int,choices=[1,2],default=1)
     parser.add_argument('--context', choices=sorted(CONTEXTS))
+    parser.add_argument('--reference',choices=sorted(EVIDENCE_REFERENCES),default='unsure')
+    parser.add_argument('--observation',default='{}')
     args = parser.parse_args()
+    if args.command=='record-game-evidence':
+        try:
+            if len(args.observation)>4096:raise ValueError('Observation is too large.')
+            print(json.dumps(record_game_evidence(args.appid,args.reference,json.loads(args.observation))))
+        except (ValueError,TypeError,OSError) as exc:print(json.dumps({'ok':False,'error':str(exc) if isinstance(exc,ValueError) else 'Cannot save local evidence. Existing game files are unchanged.'}))
+        return
     if args.command=='process-status':
         appid=steam_id(args.appid)
         if args.context and (args.context!=config()['context'] or not any(g['appid']==appid for g in installed_games())):

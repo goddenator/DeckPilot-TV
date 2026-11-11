@@ -16,11 +16,12 @@ export type State = Result & {
   display?:{vrr_capability:string;vrr_enabled:string;note:string;external_outputs:{connector:string;advertised_modes:string[]}[]};
   update?:{available?:boolean;version?:string;can_undo?:boolean;status?:string;github?:{message?:string}};
 };
-export type Checkup = Result & {supported_files?:number;verified_files?:number;coverage?:{message?:string;probes?:{kind:string;status:string;known_keys:number}[]};process?:{state?:string;reason?:string;appid?:string;message?:string;counts?:Record<string,number>};status?:string;optimised?:boolean;can_restore?:boolean;backups?:number};
+export type Checkup = Result & {supported_files?:number;verified_files?:number;coverage?:{message?:string;partial?:boolean;native_checks?:Record<string,boolean>;probes?:{kind:string;status:string;known_keys:number}[]};process?:{state?:string;reason?:string;appid?:string;message?:string;counts?:Record<string,number>};status?:string;optimised?:boolean;can_restore?:boolean;backups?:number};
 export type Report = {source:string;url:string;device:string;game_version?:string;report_date?:string;retrieved_at:string;resolution?:string;fps?:string;fps_kind?:string;report_id?:string;display_context:string;summary:string;uncertainty:string;stale?:boolean};
 export type Research = Result & {game?:Game;reports?:Report[];recommendation?:{mode:Mode;confidence:string;reason:string;note:string};sources?:{source:string;status:string;url:string;page_url?:string;message?:string;cached?:boolean;stale?:boolean}[]};
 export type Preview = Result & {status?:string;token?:string;summary?:{resolution:string;quality?:string;files:number;manual_files:number};files?:{file:string;location?:string;adapter:string;manual_changes:boolean;changes:{key:string;before?:string;after:string}[]}[]};
 export const api = {
+  recordEvidence: callable<[string,string,import('./steamEvidence').SteamObservation],Result & {evidence?:{appid:string;proc_state:string;proc_reason:string;steam_ui:{status:string;listed_running?:boolean;display_status?:number}}}>('record_game_evidence'),
   processState:callable<[string,Profile],{state?:string}>('process_state'),
   getUpdates: callable<[],UpdateSuite>('get_updates'),
   checkUpdates: callable<[],UpdateSuite>('check_updates'),

@@ -1,6 +1,6 @@
 # DeckPilot development roadmap
 
-This branch is an unreleased v0.8.3-preview.5 development build for PR #3 and the redesign feedback in issue #4. No release or hardware readiness is implied.
+This branch is an unreleased v0.8.3-preview.6 development build for PR #3 and the redesign feedback in issue #4. No release or hardware readiness is implied.
 
 ## Shipped in this development branch
 
@@ -58,3 +58,5 @@ The lower-risk first experiment is an **opt-in DeckPilot-controlled Play button*
 Release acceptance remains review, green CI for the exact head, on-device checks, a separately approved tag/release with GitHub-issued digest, and installation/rollback validation. No merge, tag or release is part of this task.
 
 The major reliability programme is staged in [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md). Stage 1 implements Gaming Mode file-picker update preparation and verification; see [PREVIEW-5.md](PREVIEW-5.md). The actual Deck running-state blocker and ATS/FFX adapters remain unresolved.
+
+Preview.6 adds conditional native ATS effects support and paired selected-game Steam/proc evidence; the actual Deck running-state blocker remains unresolved. See [PREVIEW-6.md](PREVIEW-6.md).

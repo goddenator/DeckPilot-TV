@@ -192,3 +192,24 @@ test('closed-state evidence does not display a visibility blocker',async({page})
  await expect(page.getByText('No game process found in the completed check.',{exact:true})).toBeVisible();
  await expect(page.getByText(/Settings changes are blocked/)).toHaveCount(0);
 });
+
+test('selected-game evidence is read-only and reports native/proc disagreement',async({page})=>{
+ await page.addInitScript(()=>{
+  (window as any).appStore={m_bIsInitialized:true,GetAppOverviewByAppID:(appid:number)=>({appid,display_name:'PRIVATE',local_per_client_data:{installed:true,display_status:11}})};
+  (window as any).SteamUIStore={RunningApps:[]};
+ });
+ const {calls}=await setup(page);await openGame(page);
+ await page.route('**/rpc',async route=>{
+  const {name,args}=route.request().postDataJSON();
+  if(name==='record_game_evidence'){
+   calls.push({name,args});await route.fulfill({json:{ok:true,message:'Local evidence saved. No settings changed.',evidence:{appid:args[0],proc_state:'uncertain',proc_reason:'exe-permission',steam_ui:args[2]}}});
+  }else await route.fallback();
+ });
+ await button(page,'Advanced').click();await button(page,'Record game evidence').click();await button(page,'Steam shows Play').click();
+ await expect(page.getByText(/Recorded process: uncertain/)).toBeVisible();
+ await expect(page.getByText(/Diagnostic observation only — does not confirm closure/)).toBeVisible();
+ const record=calls.find(c=>c.name==='record_game_evidence');expect(record?.args[0]).toBe('100');expect(record?.args[1]).toBe('steam-play');
+ expect(record?.args[2].listed_running).toBe(false);expect(JSON.stringify(record?.args)).not.toContain('PRIVATE');
+ expect(calls.filter(c=>['approve','set_mode','play_approve','update_app'].includes(c.name))).toHaveLength(0);
+ expect(await page.evaluate(()=>(window as any).steamCalls)).toEqual([]);
+});

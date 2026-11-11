@@ -103,6 +103,9 @@ class Plugin:
     async def set_measurements(self, enabled: bool):
         if not isinstance(enabled, bool): return {'ok': False, 'error': 'Expected on/off'}
         return await self._run('measurements-enable' if enabled else 'measurements-disable')
+    async def record_game_evidence(self, appid: str, reference: str, observation: dict):
+        if not isinstance(observation,dict) or len(json.dumps(observation))>4096:return {'ok':False,'error':'Invalid observation'}
+        return await self._run('record-game-evidence',str(appid),'--reference',str(reference),'--observation',json.dumps(observation))
     async def diagnostics(self): return await self._run('export')
     async def cloud_action(self, action: str):
         if action not in ('enable', 'disable', 'upload'): return {'ok': False, 'error': 'Unknown diagnostics action'}
