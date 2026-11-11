@@ -8,7 +8,7 @@ export type Game = {appid:string;name:string;mode?:Mode;supported?:boolean;adapt
 export type UpdateSuite = Result & {protocol?:number;channel?:string;repository?:string;app_installed?:string;plugin_installed?:string;compatible?:boolean;status?:string;operation?:{status?:string;message?:string};available?:boolean;version?:string;token?:string;commit?:string;app_needed?:boolean;plugin_needed?:boolean;downgrade?:boolean;app_first?:boolean;app_rollback?:boolean;plugin_rollback?:boolean;recovery_required?:boolean};
 export type State = Result & {
   plugin_version?:string;update_suite?:UpdateSuite;
-  version?:string;schema_version?:number;context?:Profile;default?:Mode;
+  version?:string;build_id?:string;schema_version?:number;context?:Profile;default?:Mode;
   profiles?:Record<Profile,{default:Mode;games:Record<string,Mode>}>;
   games?:Game[];saved_games?:Record<string,Mode>;measurements_enabled?:boolean;
   cloud?:{enabled?:boolean;connection?:string;last_status?:string};
@@ -16,7 +16,7 @@ export type State = Result & {
   display?:{vrr_capability:string;vrr_enabled:string;note:string;external_outputs:{connector:string;advertised_modes:string[]}[]};
   update?:{available?:boolean;version?:string;can_undo?:boolean;status?:string;github?:{message?:string}};
 };
-export type Checkup = Result & {process?:{state?:string;reason?:string;appid?:string};status?:string;optimised?:boolean;can_restore?:boolean;backups?:number};
+export type Checkup = Result & {supported_files?:number;verified_files?:number;coverage?:{message?:string;probes?:{kind:string;status:string;known_keys:number}[]};process?:{state?:string;reason?:string;appid?:string;message?:string;counts?:Record<string,number>};status?:string;optimised?:boolean;can_restore?:boolean;backups?:number};
 export type Report = {source:string;url:string;device:string;game_version?:string;report_date?:string;retrieved_at:string;resolution?:string;fps?:string;fps_kind?:string;report_id?:string;display_context:string;summary:string;uncertainty:string;stale?:boolean};
 export type Research = Result & {game?:Game;reports?:Report[];recommendation?:{mode:Mode;confidence:string;reason:string;note:string};sources?:{source:string;status:string;url:string;page_url?:string;message?:string;cached?:boolean;stale?:boolean}[]};
 export type Preview = Result & {status?:string;token?:string;summary?:{resolution:string;quality?:string;files:number;manual_files:number};files?:{file:string;location?:string;adapter:string;manual_changes:boolean;changes:{key:string;before?:string;after:string}[]}[]};

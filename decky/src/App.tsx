@@ -14,7 +14,7 @@ const MODES:[Mode,string,string][] = [
 type Screen = 'home'|'find'|'game'|'settings'|'advanced'|'updates';
 type Detail = 'main'|'review'|'restore'|'sources';
 const row = (children:ReactNode,key?:string)=><PanelSectionRow key={key}>{children}</PanelSectionRow>;
-const statusLabels:Record<string,string> = {ready:'Ready',running:'Game running','needs-review':'Review settings','manual-changes':'Your changes are safe','settings-match':'Settings match','not-installed':'Not installed',advisory:'Advice only',error:'Checkup unavailable'};
+const statusLabels:Record<string,string> = {ready:'Ready',uncertain:'Cannot confirm game closed',running:'Game running','needs-review':'Review settings','manual-changes':'Your changes are safe','settings-match':'Settings match','not-installed':'Not installed',advisory:'Advice only',error:'Checkup unavailable'};
 const labelFor=(mode?:Mode)=>MODES.find(([m])=>m===mode)?.[1]||'Balanced';
 
 export function DeckPilotApp(){
@@ -82,7 +82,10 @@ export function DeckPilotApp(){
   const chooseMode=(m:Mode)=>void run(async()=>{
     setReview(undefined);
     const r=await api.mode(m,screen==='game'&&game?game.appid:'',context);
-    if(r.ok!==false&&!r.error&&game&&screen==='game')await refreshGame();return r;
+    if(r.ok===false||r.error)return r;
+    const fresh=game&&screen==='game'?await refreshGame():undefined;
+    const support=fresh?.error||fresh?.ok===false?'Support check unavailable; no settings were changed.':fresh?.status==='advisory'?'Advice only: no supported settings file.':'Use Review & Apply for supported settings.';
+    return {...r,message:'Preference saved — no settings were changed. 0 files changed. '+(fresh?support:'Review & Apply each supported game before changes.')};
   });
   const bigButton=(text:string,onClick:()=>void,description?:string,disabled=false,key?:string)=>row(<ButtonItem layout="below" childrenContainerWidth="max" disabled={busy||disabled} onClick={onClick} description={description}>{text}</ButtonItem>,key||text.replace(/^✓ /,'').split(' · ')[0]);
   const modeButtons=()=>MODES.map(([m,title,description])=>bigButton((mode===m?'✓ ':'')+title,()=>chooseMode(m),description,!modern||offline));
@@ -139,7 +142,7 @@ export function DeckPilotApp(){
         {row(<div className="dp-card"><b>{checkup?.error?'Checkup unavailable':statusLabels[checkup?.status||'']||'Checking…'}</b><p>{checkup?.error||checkup?.message}</p>{Boolean(checkup?.backups)&&<div className="dp-small">Backups kept · {checkup?.can_restore?'Restore available':'Newer changes stay protected'}</div>}</div>)}
         {checkup?.error&&bigButton('Retry checkup',()=>void run(refreshGame))}
       </PanelSection>
-      <PanelSection title="Your choice">{modeButtons()}</PanelSection>
+      <PanelSection title="Your choice">{row(<p className="dp-small">Chosen mode: {labelFor(mode)}. Choosing a mode only saves a preference. {checkup?.supported_files?`${checkup.supported_files} supported file(s); ${checkup.verified_files||0} currently match.`:checkup?.status==='advisory'?'Advice only — no supported settings file.':'Review & Apply before changes.'}</p>)}{modeButtons()}</PanelSection>
       <PanelSection>
         {modern&&!offline&&info.launch_prompt?.enabled&&info.launch_prompt.protocol===2&&info.games?.some(g=>g.appid===game.appid)&&bigButton('Play with DeckPilot',()=>void launchController.start({appid:game.appid,name:game.name,context,installed:true,enabled:true}),'Opt-in cached advice before launching.',checkup?.status==='running')}
         {bigButton('Review & Apply',()=>void run(async()=>{
@@ -157,7 +160,7 @@ export function DeckPilotApp(){
     </>}
 
     {screen==='game'&&game&&detail==='review'&&review&&<PanelSection title="Review settings">
-      {row(<div className="dp-card"><b>{labelFor(review.mode)} · {review.context==='docked'?'Docked':'Handheld'}</b><p>{review.preview.summary?.resolution||'Conservative local preset'}{review.preview.summary?.quality?' · '+review.preview.summary.quality:''}</p><p>{review.preview.summary?.files||review.preview.files?.length||0} settings file(s). Backups first.</p>{Boolean(review.preview.summary?.manual_files)&&<p>Your newer edits will be skipped.</p>}<div className="dp-small">Saves are never changed. This is not a benchmark.</div></div>)}
+      {row(<div className="dp-card"><b>{labelFor(review.mode)} · {review.context==='docked'?'Docked':'Handheld'}</b><p>{review.preview.summary?.resolution||'Conservative local preset'}{review.preview.summary?.quality?' · '+review.preview.summary.quality:''}</p><p>{review.preview.summary?.files||review.preview.files?.length||0} settings file(s) to review. 0 files changed yet. Backups first.</p>{Boolean(review.preview.summary?.manual_files)&&<p>Your newer edits will be skipped.</p>}<div className="dp-small">Saves are never changed. This is not a benchmark.</div></div>)}
       {bigButton('Apply Settings',()=>void run(async()=>{const r=await api.approve(review.appid,review.mode,review.preview.token!,review.context);setDetail('main');setReview(undefined);await refreshGame();return r;}),undefined,offline)}
       {bigButton('Cancel',()=>{setDetail('main');setReview(undefined);})}
       {bigButton(technical?'Hide Advanced details':'Advanced details',()=>setTechnical(!technical))}
@@ -191,6 +194,9 @@ export function DeckPilotApp(){
     {screen==='advanced'&&<>
       {game&&<PanelSection title={game.name}>
         {row(<p className="dp-small">Game state: {checkup?.process?.state||'not checked'} · {checkup?.process?.reason||'Refresh Checkup for evidence'}</p>)}
+        {checkup?.process?.message&&row(<p className="dp-small">{checkup.process.message}{checkup.process.state==='uncertain'?' Settings changes are blocked. Use Steam Play/Resume.':''}</p>)}
+        {checkup?.process?.counts&&row(<div className="dp-small">{Object.entries(checkup.process.counts).map(([reason,count])=><p key={reason}>{reason}: {count}</p>)}</div>)}
+        {checkup?.coverage&&row(<div className="dp-small">{checkup.coverage.message}{checkup.coverage.probes?.map(p=><p key={p.kind}>{p.kind}: {p.status} · {p.known_keys} known setting keys. Read-only.</p>)}</div>)}
         {checkup?.can_restore&&bigButton('Restore game settings',()=>{setScreen('game');setDetail('restore');})}
         {bigButton('Refresh Game Checkup',()=>void run(refreshGame))}
       </PanelSection>}
@@ -222,7 +228,7 @@ export function DeckPilotApp(){
       </PanelSection>
       <PanelSection title="Display & App">
         {row(<p className="dp-small">VRR capability: {info.display?.vrr_capability||'unknown'}. VRR enabled: {info.display?.vrr_enabled||'unknown'}. {info.display?.note}</p>)}
-        {row(<p className="dp-small">App {info.version||'unknown'} · Plugin {info.plugin_version||'0.8.3-preview.3'}. {info.update?.github?.message}</p>)}
+        {row(<p className="dp-small">App {info.build_id||info.version||'unknown'} · Plugin {info.plugin_version||'0.8.3-preview.4'}. {info.update?.github?.message}</p>)}
         {bigButton('Refresh status',()=>void run(async()=>{await refresh();return {message:'Refreshed.'};}))}
       </PanelSection>
     </>}

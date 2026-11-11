@@ -1,4 +1,6 @@
-# DeckPilot TV — v0.8.3-preview.3 development
+# DeckPilot TV — v0.8.3-preview.4 development
+
+Preview.4 investigation, limitations and controller-only device checks: [docs/PREVIEW-4.md](docs/PREVIEW-4.md).
 
 A free, cautious Steam Deck OLED optimisation assistant with three choices: **Best Graphics**, **Best Performance**, and **Balanced**. This is an unreleased development build on PR #3; nothing is merged or published.
 

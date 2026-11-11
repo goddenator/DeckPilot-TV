@@ -34,7 +34,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 VERSION = '0.8.3'
-BUILD_ID = '0.8.3-preview.3'
+BUILD_ID = '0.8.3-preview.4'
 APP = 'deckpilot-tv'
 PORT = 38647
 MODES = {'graphics', 'performance', 'balanced'}
@@ -713,6 +713,40 @@ def adapter_files(game):
     return [(p, 'unreal') for p in find_ue_configs(game)] + [(p, 'valheim-native' if game['appid'] == '892970' else 'hollow-knight-native') for p in find_valheim_configs(game)]
 
 
+def settings_coverage(game, home=None):
+    """Read-only adapter research. No candidate contents or private paths exported.
+
+    ATS identity is confirmed in issue #6. FFX identity is read from this device's
+    installed manifest, never assigned from a title guess. Candidates do not grant
+    write support. Their actual formats still need device evidence and review.
+    """
+    files = adapter_files(game)
+    result = {'appid': game['appid'], 'supported_files': len(files),
+              'adapters': sorted({a for _, a in files}), 'writable': bool(files)}
+    if files: return {**result, 'message': 'Existing compatible settings found. Review exact keys before applying.'}
+    if game['appid'] == '270880':
+        base = Path(home) if home is not None else Path.home()
+        candidates = [base / '.local/share/American Truck Simulator/config.cfg',
+                      Path(game['library']) / 'compatdata/270880/pfx/drive_c/users/steamuser/Documents/American Truck Simulator/config.cfg']
+        probes = []
+        keys = ('r_mode_width', 'r_mode_height', 'r_scale_x', 'r_scale_y', 'r_fullscreen')
+        for label, path in zip(('native', 'proton'), candidates):
+            probe = {'kind': label, 'status': 'absent', 'known_keys': 0}
+            try:
+                if any(p.is_symlink() for p in (path, *path.parents)):
+                    probe['status'] = 'unsafe-path'
+                elif path.is_file():
+                    raw = safe_read_text(path)
+                    found = re.findall(r'^\s*uset\s+(r_[a-z_]+)\s+"[^"\r\n]*"\s*$', raw, re.M)
+                    probe.update(status='candidate', known_keys=sum(found.count(k) == 1 for k in keys))
+            except (OSError, ValueError, UnicodeError): probe['status'] = 'unreadable'
+            probes.append(probe)
+        return {**result, 'probes': probes, 'message': 'ATS is advice only. Candidate checks are read-only; no approved ATS adapter yet.'}
+    if re.search(r'final\s+fantasy\s+x(?:\b|/)', game.get('name', ''), re.I):
+        return {**result, 'message': 'Final Fantasy X is advice only. Installed App ID recorded; configuration format needs device verification.'}
+    return {**result, 'message': 'Advice only. No supported settings file.'}
+
+
 def transform_adapter(path, raw, mode, adapter, context=None):
     if adapter == 'unreal': return transform_ue_ini(raw, mode, context)
     if adapter in ('valheim-native', 'hollow-knight-native'): return transform_valheim(raw, mode, context)
@@ -735,7 +769,7 @@ def save_mode(mode, appid=None, context=None):
         profile['default'] = mode
         cfg['approved'] = {k: v for k, v in cfg['approved'].items() if k in profile['games']}
     write_config(cfg)
-    return {'ok': True, 'mode': mode, 'context': context, 'message': 'Preference saved. Preview before applying.'}
+    return {'ok': True, 'mode': mode, 'context': context, 'files_changed': 0, 'settings_changed': False, 'message': 'Preference saved — no settings were changed. 0 files changed. Review & Apply is required for supported games.'}
 
 
 @game_transaction
@@ -809,8 +843,16 @@ def approve_profile(appid, mode, token, context=None):
             cfg['approved_context'][appid] = context
             cfg['approved_files'][appid] = preview['paths']
             write_config(cfg)
+        else:
+            # An uncertain/partial result revokes any earlier sync grant too;
+            # the background service must not retry after a failed readback.
+            cfg = config()
+            for key in ('approved', 'approved_files', 'approved_context'):
+                cfg[key].pop(appid, None)
+            write_config(cfg)
         return {'ok': result['status'] in ('applied', 'already-set'), 'result': result,
-                'message': ('Updated '+str(result.get('count', 0))+' file(s). ' if result.get('count') else '') + 'Local settings: ' + result['status'] + '. Manual/game changes are preserved.'}
+                'files_changed': result.get('count', 0), 'verified_files': result.get('verified_count', 0),
+                'message': str(result.get('count', 0))+' files changed; '+str(result.get('verified_count', 0))+' readbacks verified. Local settings: ' + result['status'] + '. Manual/game changes are preserved.'}
 
 
 @game_transaction
@@ -819,9 +861,12 @@ def game_checkup(appid, context=None):
     game = next((g for g in installed_games() if g['appid'] == appid), None)
     mode = effective_mode(appid, cfg, context)
     result = {'ok': True, 'appid': appid, 'context': context, 'mode': mode,
-              'status': 'not-installed', 'can_restore': False, 'backups': 0, 'optimised': False}
+              'status': 'not-installed', 'can_restore': False, 'backups': 0, 'optimised': False,
+              'supported_files': 0, 'verified_files': 0}
     if not game: return {**result, 'message': 'Saved for when you install it.'}
     files = adapter_files(game)
+    result['supported_files'] = len(files)
+    result['coverage'] = settings_coverage(game)
     result['process']=game_running_state(appid)
     if not files: return {**result, 'status': 'advisory', 'message': 'Advice only. No supported settings file.'}
     visibility=result['process']
@@ -832,7 +877,9 @@ def game_checkup(appid, context=None):
     for path, adapter in files:
         try:
             raw = safe_read_text(path)
-            matches &= transform_adapter(path, raw, mode, adapter, context) == raw
+            file_matches = transform_adapter(path, raw, mode, adapter, context) == raw
+            matches &= file_matches
+            result['verified_files'] += int(file_matches)
             record = state.get(hashlib.sha256(str(path).encode()).hexdigest()[:16], {})
             if not isinstance(record, dict): raise ValueError('Invalid backup record')
             if record:
@@ -1075,58 +1122,152 @@ def safe_read_text(path):
 PROC_ROOT = Path('/proc')
 PROCESS_HELPERS = {'steam', 'steamwebhelper', 'steamservice', 'wineserver', 'pressure-vessel', 'pv-bwrap', 'bwrap', 'reaper','steam-runtime-launcher-service','steam-runtime-launch-client','pressure-vessel-wrap','srt-bwrap','services.exe','winedevice.exe','explorer.exe','rpcss.exe','plugplay.exe'}
 
+# Counts are fixed categories only: no PID, name, path, environment or command line.
+PROCESS_PROBE_MESSAGES = {
+    'owner-permission': 'SteamOS denied access to process ownership.',
+    'owner-read': 'Process ownership could not be established.',
+    'stat-permission': 'Process identity is protected by SteamOS.',
+    'stat-format': 'A process identity record could not be parsed.',
+    'stat-read': 'A process identity record could not be read.',
+    'environment-permission': 'SteamOS denied access to a process environment.',
+    'environment-read': 'A process environment could not be read.',
+    'environment-limit': 'A process environment exceeded the safe read limit.',
+    'exe-permission': 'SteamOS denied access to a process executable identity.',
+    'exe-read': 'A process executable identity could not be read.',
+    'cmdline-permission': 'SteamOS denied access to Wine process identity.',
+    'cmdline-read': 'Wine process identity could not be read.',
+    'cmdline-limit': 'Wine process identity exceeded the safe read limit.',
+    'attribute-missing': 'A live process has an unavailable identity attribute.',
+    'process-changed': 'A process changed identity during the check.',
+    'conflicting-app-id': 'A process advertises conflicting Steam game identities.',
+    'helper-app-id': 'A Steam helper still advertises this game identity.',
+    'wine-helper': 'A Wine service still advertises this game identity.',
+    'wine-identity': 'Wine game identity could not be confirmed.',
+    'proc-unavailable': 'SteamOS process visibility is unavailable.',
+    'scan-limit': 'The process check reached its safe time or size limit.',
+}
+
+
+def parse_process_stat(raw):
+    """Linux proc_pid_stat(5): comm may contain spaces, ')' and non-UTF8 bytes.
+
+    fields[0] is field 3 (state); flags is field 9, starttime is field 22.
+    Read as bytes so an unrelated non-UTF8 comm cannot poison every game check.
+    """
+    if isinstance(raw, str): raw = raw.encode('utf-8', errors='surrogateescape')
+    end = raw.rfind(b')'); begin = raw.find(b'(')
+    fields = raw[end + 2:].split()
+    if begin < 1 or end <= begin or len(fields) < 20:
+        raise ValueError('Invalid process identity')
+    pid = int(raw[:begin].strip()); flags = int(fields[6]); start = int(fields[19])
+    if pid <= 0 or flags < 0 or start < 0 or fields[0] not in (b'R', b'S', b'D', b'Z', b'T', b't', b'X', b'x', b'K', b'W', b'P', b'I'):
+        raise ValueError('Invalid process identity')
+    return raw[begin + 1:end].decode('utf-8', errors='surrogateescape'), fields[0].decode(), start, flags
+
+
 def game_running_state(appid, proc=None):
     """Bounded, read-only evidence. Unknown never grants permission to write."""
-    appid=steam_id(appid); proc=Path(proc) if proc is not None else PROC_ROOT
-    deadline=time.monotonic()+0.5; uncertain=set(); scanned=0
-    def result(state,reason):
-        value={'appid':appid,'state':state,'source':'proc','reason':reason,'scanned':scanned}
-        return value
+    appid = steam_id(appid); proc = Path(proc) if proc is not None else PROC_ROOT
+    deadline = time.monotonic() + 0.5
+    uncertain = set(); counts = {}; scanned = 0
+
+    def count(category): counts[category] = counts.get(category, 0) + 1
+    def block(category): count(category); uncertain.add(category)
+    def result(state, reason):
+        return {'appid': appid, 'state': state, 'source': 'proc', 'reason': reason,
+                'scanned': scanned, 'counts': dict(sorted(counts.items())),
+                'message': PROCESS_PROBE_MESSAGES.get(reason, 'Exact game process found.' if state == 'running' else 'No game process found in the completed check.')}
     def identity(item):
-        raw=(item/'stat').read_text(); end=raw.rfind(')'); fields=raw[end+2:].split()
-        if end<0 or len(fields)<20:raise ValueError('Invalid process identity')
-        return raw[raw.find('(')+1:end],fields[0],fields[19]
+        with (item / 'stat').open('rb') as handle: raw = handle.read(16385)
+        if len(raw) > 16384: raise ValueError('Invalid process identity')
+        return parse_process_stat(raw)
+    def helper(comm, exe):
+        # Linux TASK_COMM_LEN is 16 including NUL. Long Steam helper names are
+        # truncated by the kernel; executable corroboration is still mandatory.
+        return exe in PROCESS_HELPERS and comm in (exe, exe[:15])
     try:
         with os.scandir(proc) as entries:
             for entry in entries:
-                if not entry.name.isdigit():continue
-                scanned+=1
-                if scanned>4096 or time.monotonic()>deadline:return result('uncertain','scan-limit')
-                item=proc/entry.name
+                if not entry.name.isdigit(): continue
+                scanned += 1
+                if scanned > 4096 or time.monotonic() > deadline:
+                    block('scan-limit'); return result('uncertain', 'scan-limit')
+                item = proc / entry.name; stage = 'stat'
                 try:
-                    if item.stat().st_uid!=os.getuid():continue
-                    comm,status,start=identity(item)
-                    if status in ('Z','X'):continue
+                    directory_uid = item.stat().st_uid
+                    if directory_uid != os.getuid():
+                        if directory_uid != 0: continue
+                        # Linux changes nondumpable processes' proc ownership to
+                        # root. Consult real/effective/saved/fs UIDs rather than
+                        # silently ignoring a protected game owned by this user.
+                        stage = 'owner'
+                        with (item / 'status').open('rb') as handle: ownership = handle.read(65537)
+                        match = re.search(rb'^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$', ownership, re.M)
+                        if len(ownership) > 65536 or not match: block('owner-read'); continue
+                        if os.getuid() not in [int(v) for v in match.groups()]: continue
+                    stage = 'stat'
+                    comm, status, start, flags = identity(item)
+                    if status in ('Z', 'X', 'x'): count('exited'); continue
+                    # PF_KTHREAD is kernel evidence, unlike an empty cmdline or
+                    # a helper-like name. Kernel threads cannot be Steam games.
+                    if flags & 0x00200000: count('kernel-thread'); continue
+                    stage = 'environment'
                     try:
-                        with (item/'environ').open('rb') as handle:blob=handle.read(262145)
+                        with (item / 'environ').open('rb') as handle: blob = handle.read(262145)
                     except PermissionError:
-                        helper_exe=Path(os.readlink(item/'exe')).name
-                        if comm not in PROCESS_HELPERS or helper_exe not in PROCESS_HELPERS:uncertain.add('process-permission')
+                        count('environment-permission'); stage = 'exe'
+                        exe = Path(os.readlink(item / 'exe')).name.removesuffix(' (deleted)')
+                        stage = 'stat'; after = identity(item)
+                        if (comm, start) != (after[0], after[2]): block('process-changed')
+                        elif after[1] in ('Z', 'X', 'x'): count('exited')
+                        elif helper(comm, exe): count('unrelated-helper')
+                        else: uncertain.add('environment-permission')
                         continue
-                    if len(blob)>262144:uncertain.add('environment-limit');continue
-                    fields=blob.split(b'\0'); ids={}
-                    for field in fields:
-                        key,_,value=field.partition(b'=')
-                        if key in (b'SteamAppId',b'SteamGameId'):ids[key]=value
-                    if appid.encode() not in ids.values():continue
-                    if any(v not in (appid.encode(),b'0',b'') for v in ids.values()):uncertain.add('conflicting-app-id');continue
-                    after=identity(item)
-                    if after[1] in ('Z','X'):continue
-                    if (comm,start)!=(after[0],after[2]):uncertain.add('process-changed');continue
-                    exe=Path(os.readlink(item/'exe')).name
-                    if comm in PROCESS_HELPERS or exe in PROCESS_HELPERS or re.fullmatch(r'python(?:[0-9]+(?:\.[0-9]+)?)?|bash|sh|proton',exe):
-                        uncertain.add('helper-app-id');continue
-                    if exe in ('wine','wine64','wine-preloader','wine64-preloader'):
-                        with (item/'cmdline').open('rb') as handle:args=handle.read(16384).split(b'\0')
-                        if any(a.replace(b'\\',b'/').rsplit(b'/',1)[-1].decode(errors='replace').lower() in PROCESS_HELPERS for a in args):
-                            uncertain.add('wine-helper');continue
+                    if len(blob) > 262144: block('environment-limit'); continue
+                    ids = {}; conflicting = False
+                    for field in blob.split(b'\0'):
+                        key, _, value = field.partition(b'=')
+                        if key in (b'SteamAppId', b'SteamGameId'):
+                            if key in ids and ids[key] != value: conflicting = True
+                            ids[key] = value
+                    if conflicting: block('conflicting-app-id'); continue
+                    if appid.encode() not in ids.values(): continue
+                    if any(v not in (appid.encode(), b'0', b'') for v in ids.values()): block('conflicting-app-id'); continue
+                    stage = 'stat'; after = identity(item)
+                    if after[1] in ('Z', 'X', 'x'): count('exited'); continue
+                    if (comm, start) != (after[0], after[2]): block('process-changed'); continue
+                    stage = 'exe'; exe = Path(os.readlink(item / 'exe')).name.removesuffix(' (deleted)')
+                    if helper(comm, exe) or comm in PROCESS_HELPERS or exe in PROCESS_HELPERS or re.fullmatch(r'python(?:[0-9]+(?:\.[0-9]+)?)?|bash|sh|proton', exe):
+                        block('helper-app-id'); continue
+                    if exe in ('wine', 'wine64', 'wine-preloader', 'wine64-preloader'):
+                        stage = 'cmdline'
+                        with (item / 'cmdline').open('rb') as handle: raw = handle.read(16385)
+                        if len(raw) > 16384: block('cmdline-limit'); continue
+                        args = raw.split(b'\0')
+                        if any(a.replace(b'\\', b'/').rsplit(b'/', 1)[-1].decode(errors='replace').lower() in PROCESS_HELPERS for a in args):
+                            block('wine-helper'); continue
                         if not any(a.lower().endswith(b'.exe') and b'wine' not in a.lower() for a in args):
-                            uncertain.add('wine-identity');continue
-                    return result('running','exact-app-process')
-                except FileNotFoundError:continue  # normal process exit, not evidence of a game
-                except (OSError,ValueError):uncertain.add('process-unreadable')
-    except OSError:return result('uncertain','proc-unavailable')
-    return result('uncertain',sorted(uncertain)[0]) if uncertain else result('closed','no-app-process')
+                            block('wine-identity'); continue
+                    # Recheck after the final attribute read too, not just before.
+                    stage = 'stat'; after = identity(item)
+                    if after[1] in ('Z', 'X', 'x'): count('exited'); continue
+                    if (comm, start) != (after[0], after[2]): block('process-changed'); continue
+                    return result('running', 'exact-app-process')
+                except FileNotFoundError:
+                    # ENOENT on exe/environ is not proof the PID exited. A live
+                    # unreadable process remains unknown (including hidden exe).
+                    try: identity(item)
+                    except FileNotFoundError: count('pid-exited')
+                    except (OSError, ValueError): block('stat-read')
+                    else: block('attribute-missing')
+                except PermissionError: block(stage + '-permission')
+                except ValueError: block('stat-format' if stage == 'stat' else stage + '-read')
+                except OSError: block(stage + '-read')
+    except OSError:
+        block('proc-unavailable'); return result('uncertain', 'proc-unavailable')
+    if time.monotonic() > deadline: block('scan-limit')
+    reason = sorted(uncertain)[0] if uncertain else 'no-app-process'
+    return result('uncertain' if uncertain else 'closed', reason)
 
 
 def game_is_running(appid):
@@ -1147,6 +1288,7 @@ def apply_profile(game, mode, force=False, allowed_files=None, context=None, exp
     previous = read_json(STATE, {})
     if not isinstance(previous, dict): return {'status': 'error', 'count': 0}
     changed = 0
+    verified = 0
     skipped_manual = 0
     backups = 0
     errors = 0
@@ -1206,17 +1348,27 @@ def apply_profile(game, mode, force=False, allowed_files=None, context=None, exp
                                     'backup': old.get('backup', str(backup)), 'backup_sha256':backup_digest(managed_backup), 'before_sha':sha(original), 'mode': mode, 'after_sha': sha(updated)}
                 atomic_json(STATE, previous)
                 temp.replace(path)
+                changed += 1
+                if safe_read_text(path) != updated:
+                    raise ValueError('Settings readback did not match; backup retained for review.')
             finally:
                 if temp is not None: temp.unlink(missing_ok=True)
-            changed += 1
+            verified += 1
         except (OSError, UnicodeError, ValueError) as ex:
             errors += 1
             log('SKIP ' + game['appid'] + ' ' + str(path) + ': ' + str(ex))
+    if changed != verified:
+        # Covers the background synchronizer as well as explicit approval.
+        # A written file with an unverified readback must not retain sync consent.
+        cfg = config()
+        for key in ('approved', 'approved_files', 'approved_context'):
+            cfg[key].pop(game['appid'], None)
+        write_config(cfg)
     if changed:
         atomic_json(STATE, previous)
         log('APPLY ' + game['appid'] + ' ' + game['name'] + ' mode=' + mode + ' files=' + str(changed))
     return {'status': 'error' if errors else ('manual-changes' if skipped_manual else ('applied' if changed else 'already-set')),
-            'count': changed, 'backups': backups, 'skipped_manual': skipped_manual}
+            'count': changed, 'verified_count': verified, 'backups': backups, 'skipped_manual': skipped_manual}
 
 
 @game_transaction
@@ -1464,7 +1616,8 @@ def diagnostic_report(include_process=False):
     except OSError:
         os_name = 'Linux'
     return {
-        **({'process_checks':[game_running_state(g['appid']) for g in games[:8]]} if include_process else {}),
+        **({'process_checks':[game_running_state(g['appid']) for g in games[:8]],
+            'settings_coverage':[settings_coverage(g) for g in games[:100]]} if include_process else {}),
         'format': 1, 'app': 'DeckPilot TV', 'version': VERSION, 'build_id': BUILD_ID,
         'created_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
         'operating_system': os_name[:120], 'kernel': platform.release()[:120],

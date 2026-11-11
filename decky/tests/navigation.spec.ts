@@ -144,3 +144,51 @@ test('older installed apps need an update before using profile controls',async({
  await expect(page.getByRole('button',{name:'Best Graphics',exact:true})).toBeDisabled();
  expect(calls.some(c=>c.name==='set_mode')).toBe(false);
 });
+
+
+test('mode selection explicitly reports preference-only for advisory games',async({page})=>{
+ const {calls}=await setup(page,{unsupported:true});await openGame(page);
+ await page.getByRole('button',{name:'Best Graphics',exact:true}).click();
+ await expect(page.getByRole('status')).toContainText('Preference saved — no settings were changed. 0 files changed.');
+ await expect(page.getByRole('status')).toContainText('Advice only');
+ expect(calls.filter(c=>c.name==='approve')).toHaveLength(0);
+ expect(calls.filter(c=>c.name==='preview')).toHaveLength(0);
+});
+
+test('advanced checkup explains denied executable identity with redacted counts',async({page})=>{
+ await setup(page);
+ await page.route('**/rpc',async(route)=>{
+  const {name}=route.request().postDataJSON();
+  if(name==='get_checkup')await route.fulfill({json:{ok:true,status:'uncertain',message:'Cannot confirm game closed. Settings are protected.',process:{state:'uncertain',reason:'exe-permission',message:'SteamOS denied access to a process executable identity.',counts:{'environment-permission':2,'exe-permission':2}}}});
+  else await route.fallback();
+ });
+ await openGame(page);
+ await expect(page.getByText('Cannot confirm game closed',{exact:true})).toBeVisible();
+ await button(page,'Advanced').click();
+ await expect(page.getByText('exe-permission: 2',{exact:true})).toBeVisible();
+ await expect(page.getByText(/SteamOS denied access to a process executable identity/)).toBeVisible();
+});
+
+
+test('mode confirmation uses the refreshed support state',async({page})=>{
+ await setup(page);await openGame(page);
+ await page.route('**/rpc',async route=>{
+  const {name}=route.request().postDataJSON();
+  if(name==='get_checkup')await route.fulfill({json:{ok:true,status:'advisory',message:'Advice only.'}});
+  else await route.fallback();
+ });
+ await page.getByRole('button',{name:'Best Graphics',exact:true}).click();
+ await expect(page.getByRole('status')).toContainText('Advice only: no supported settings file.');
+});
+
+test('closed-state evidence does not display a visibility blocker',async({page})=>{
+ await setup(page);
+ await page.route('**/rpc',async route=>{
+  const {name}=route.request().postDataJSON();
+  if(name==='get_checkup')await route.fulfill({json:{ok:true,status:'needs-review',process:{state:'closed',reason:'no-app-process',message:'No game process found in the completed check.'}}});
+  else await route.fallback();
+ });
+ await openGame(page);await button(page,'Advanced').click();
+ await expect(page.getByText('No game process found in the completed check.',{exact:true})).toBeVisible();
+ await expect(page.getByText(/Settings changes are blocked/)).toHaveCount(0);
+});

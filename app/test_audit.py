@@ -46,23 +46,25 @@ class ProcessEvidenceTests(unittest.TestCase):
             return original(path,*args,**kw)
         with patch.object(Path,'open',read):self.assertEqual(self.check()['state'],'uncertain')
     def test_pid_exit_and_pid_reuse(self):
-        self.process(10,'270880');original=Path.read_text;count=0
-        def read(path,*args,**kw):
+        self.process(10,'270880');original=d.parse_process_stat;count=0
+        def parse(raw):
             nonlocal count
-            raw=original(path,*args,**kw)
-            if path.name=='stat':
-                count+=1
-                if count>1:return raw.replace('123','456')
-            return raw
-        with patch.object(Path,'read_text',read):self.assertEqual(self.check()['state'],'uncertain')
-        with patch.object(Path,'read_text',side_effect=FileNotFoundError()):self.assertEqual(self.check()['state'],'closed')
+            count+=1
+            comm,status,start,flags=original(raw)
+            return comm,status,start+(1 if count>1 else 0),flags
+        with patch.object(d,'parse_process_stat',parse):self.assertEqual(self.check()['state'],'uncertain')
+        original_open=Path.open
+        def open_stat(path,*args,**kw):
+            if path.name=='stat':raise FileNotFoundError()
+            return original_open(path,*args,**kw)
+        with patch.object(Path,'open',open_stat):self.assertEqual(self.check()['state'],'closed')
     def test_proton_and_native_and_proc_denial(self):
         p=self.process(10,'270880',exe='/usr/bin/wine64-preloader',wine=True);self.assertEqual(self.check()['state'],'running')
         (p/'cmdline').write_bytes(b'wine64\0');self.assertEqual(self.check()['state'],'uncertain')
         with patch.object(d.os,'scandir',side_effect=PermissionError()):self.assertEqual(self.check()['reason'],'proc-unavailable')
     def test_result_is_redacted_and_bounded(self):
         self.process(10,'270880',exe='/private/person/secret-game');result=self.check()
-        self.assertEqual(set(result),{'appid','state','source','reason','scanned'});self.assertNotIn('secret',json.dumps(result))
+        self.assertEqual(set(result),{'appid','state','source','reason','scanned','counts','message'});self.assertNotIn('secret',json.dumps(result))
 
     def test_foreign_uid_is_not_evidence_and_scan_deadline_is_uncertain(self):
         from types import SimpleNamespace
